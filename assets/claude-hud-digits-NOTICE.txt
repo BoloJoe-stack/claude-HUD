@@ -1,0 +1,100 @@
+claude-hud-digits.ttf —— 派生字体说明（SIL OFL 1.1 条件 2 / 条件 3 / 条件 5）
+========================================================================
+
+这个文件说明 assets/claude-hud-digits.ttf 从哪来、改了什么、以及授权如何随附。
+
+1. 来源
+--------
+DSEG14 Classic-Regular
+    Copyright (c) 2018, keshikan (http://www.keshikan.net),
+    with Reserved Font Name "DSEG".
+    SIL Open Font License 1.1（全文见同目录的 DSEG-LICENSE.txt）。
+    源文件：assets/DSEG14Classic-Regular.ttf（未修改的原版，保留在本目录）。
+
+2. 这是什么（= 一份 "Modified Version"）
+----------------------------------------
+claude-hud-digits.ttf 是上面那份字体的**字符子集**：只保留
+    U+0030-U+0039   '0'-'9'
+    U+003A          ':'
+共 11 个字符，其余 82 个字符（A-Z、a-z、% . - 空格 等）全部删除。
+
+字形轮廓与水平步进（hmtx）**一字未改**：`0`-`9` 仍是 816/1000 em、`:` 仍是
+200/1000 em，与原版逐字相同（已用 fontTools 逐个比对）。所以子集里的数字
+与"原版 DSEG14 独装时"的宽度完全一致。
+
+3. 为什么改名（OFL 条件 3）
+----------------------------
+OFL 1.1 条件 3：
+
+    No Modified Version of the Font Software may use the Reserved Font
+    Name(s) unless explicit written permission is granted by the
+    corresponding Copyright Holder.
+
+原版的保留字体名是 "DSEG"。既然这是一份 Modified Version，就不能再顶着
+"DSEG" 这个名字分发。所以下面 4 个"呈现给用户的名字"全部改掉：
+
+    nameID 1（Family）        DSEG14 Classic              -> claude-hud-digits
+    nameID 4（Full name）     DSEG14 Classic-Regular      -> claude-hud-digits Regular
+    nameID 6（PostScript）    DSEG14Classic-Regular       -> claude-hud-digits
+    nameID 3（Unique ID）      FontForge 2.0 : ...         -> claude-hud-digits Regular;
+                                                              subset of DSEG14 Classic-Regular
+    nameID 5（Version）       Version 0.46                -> Version 0.46 (subset)
+
+其余名字记录不动。nameID 2（Subfamily）本来就是 "Regular"，无需改。
+
+**没有**出现在这 4 个名字里的 "DSEG" 字样要分清两类（上一版把它们混为一谈）：
+
+  · **按 OFL 条件 2 必须原样保留**的版权声明 —— nameID 0 的版权行与
+    nameID 13 的许可正文。条件 3 的限制只作用于"呈现给用户的首要字体名"
+    （the primary font name as presented to the users），保留版权行里的
+    "with Reserved Font Name \"DSEG\"" 不构成违反。
+
+  · **顺手留下、条件既不要求保留也不禁止**的残留 —— 实测还有一处：
+    **nameID 19（Sample text）仍写着 "DSEG14 12:34"**。它不是版权声明，
+    条件 2 没要求保留它；它也不是"首要字体名"，条件 3 管不到它。
+    **故不构成违规**，但上一版把"残留 = 必须保留的版权声明"讲成了通则，
+    与事实不符（漏记了这一项）。
+
+4. 授权如何随附（OFL 条件 2）
+------------------------------
+条件 2 要求每一份拷贝都带上版权声明与许可全文。本仓库的随附方式是：
+
+  · 字体二进制内部的 nameID 13（License Description）**原样保留**了完整
+    OFL 1.1 正文与版权行（4390 字符，未删改）；
+  · 字体二进制内部的 nameID 0（Copyright）追加了一段派生说明 —— 原始版权
+    行与保留字体名在其中逐字保留；
+  · 同一个目录下另放 DSEG-LICENSE.txt（OFL 1.1 全文 + 版权行），随仓库分发；
+  · 本说明文件本身。
+
+5. 授权不变（OFL 条件 5）
+--------------------------
+本派生字体**仍然整个地按 SIL Open Font License 1.1 分发**，没有、也不得
+改用任何其它许可。条件 5 同时说明"用本字体排出来的文档"不受该许可约束 ——
+所以 claude-hud 这个程序的许可与此无关。
+
+6. 复现方法（一次性离线操作，不是构建依赖）
+---------------------------------------------
+下面两条命令即可从原版重放这份子集。**cargo 构建不调用它们**，也不依赖
+Python / fontTools；结果文件已提交进仓库。
+
+    py -3.10 -m fontTools.subset DSEG14Classic-Regular.ttf ^
+        --unicodes=U+0030-0039,U+003A ^
+        --output-file=claude-hud-digits.raw.ttf ^
+        --name-IDs=* --name-legacy --name-languages=* --glyph-names --layout-features=*
+
+    py -3.10 - <<'PY'
+    from fontTools.ttLib import TTFont
+    f = TTFont("claude-hud-digits.raw.ttf"); n = f["name"]
+    for nid, val in {1:"claude-hud-digits", 2:"Regular",
+                     3:"claude-hud-digits Regular; subset of DSEG14 Classic-Regular",
+                     4:"claude-hud-digits Regular", 5:"Version 0.46 (subset)",
+                     6:"claude-hud-digits"}.items():
+        n.removeNames(nameID=nid)
+        n.setName(val, nid, 3, 1, 0x409)
+        n.setName(val, nid, 1, 0, 0)
+    # nameID 0 的派生说明见 make_subset 脚本；nameID 13 保持原样
+    f.save("claude-hud-digits.ttf")
+    PY
+
+（`FFTM` 表在子集化时会被丢弃并打印一条 WARNING，那是 FontForge 的时间戳表，
+对本字体的渲染没有任何影响。）

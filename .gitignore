@@ -1,0 +1,22 @@
+# Rust 构建产物
+/target
+**/*.rs.bk
+*.pdb
+
+# 本地运行时数据（正式位置是 %APPDATA%\claude-hud\，此处兜底）
+/sessions/
+*.local.json
+
+# git worktree —— superpowers 流程在此开隔离工作区。
+# 不忽略的后果：worktree 整棵树会被 git add -A 提交进仓库。
+.claude/worktrees/
+
+# superpowers 流程工作区（ledger / brief / report / 评审包）
+# 注意：`.superpowers/sdd/` 自带一个内容为 `*` 的 .gitignore，但它只覆盖
+# sdd/ 这一层。`.superpowers/` 下其他子目录不受保护，故在此兜底 ——
+# 否则 T11/T12 里的 `git add -A` 会把它们提交进仓库。
+/.superpowers/
+
+# 编辑器
+.vscode/
+.idea/
