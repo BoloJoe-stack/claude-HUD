@@ -660,8 +660,22 @@ fn poll_once(
     // 状态文件每轮从磁盘重读、而挂件不写回，所以"已经死了几轮"只能记在内存里。
     // 用户 2026-09-15 裁定：**先标"已退出"，连续两轮确认后再移除** —— 一次误判只让标签
     // 变一下，不会让一个活着的会话从界面上消失。
+    //
+    // ⚠️ **那条宽限只给本进程已经画过的会话**（2026-09-23 补）：`dead_streak` 里没有它 ⇒
+    // 这是启动后（或它刚冒出来时）**第一次**见到它 ⇒ 已经判死的话**一帧都不画**。
+    //
+    // 理由：宽限的作用是"别让用户正看着的那一行突然消失"，而一行**从未画出来过**的会话
+    // 没有"突然"可言。启动头一帧列出十几条早已退出的会话（2026-09-21 记下的"暖机"遗留，
+    // 真机实测：844 ms 那一帧 14 行、约 4 s 收敛到 3 行）纯是白噪声 —— 而且它正好出现在
+    // 用户刚双击、最想看"我现在有几个会话"的那一刻。9b 的状态目录清扫（2026-09-23）能让
+    // 僵尸不再堆积，但"会话刚结束、文件还在"的那一小时窗口里重启挂件照样会闪。
+    //
+    // 判错不吃亏：真会话下一轮 `host_is_gone` 返回假 ⇒ streak 归零 ⇒ 照常画出来
+    // （只晚一轮，且**不会被移除**）—— 与 09-15 那条裁定的安全方向一致。
     let mut gone: HashSet<String> = HashSet::new();
+    let mut never_shown: HashSet<String> = HashSet::new();
     for s in states.iter() {
+        let first_sight = !dead_streak.contains_key(&s.session_id);
         let streak = dead_streak.entry(s.session_id.clone()).or_insert(0);
         *streak = if host_is_gone(s, procinfo::HOST_EXE) {
             *streak + 1
@@ -670,8 +684,14 @@ fn poll_once(
         };
         if *streak >= 1 {
             gone.insert(s.session_id.clone());
+            if first_sight {
+                never_shown.insert(s.session_id.clone());
+            }
         }
     }
+    // 在**画之前**摘掉它们（不是画完再删）：那一帧里它们连"已退出"都不出现。
+    // 顶栏的"· N 个"数的是 `rows.len()`，所以这里摘掉多少，头一行就少说多少 —— 两处一致。
+    states.retain(|s| !never_shown.contains(&s.session_id));
 
     let mut rows = view::build_rows_with_deltas(&states, deltas, cfg, now);
     rows.retain(|r| dead_streak.get(&r.session_id).copied().unwrap_or(0) < 2);
@@ -3995,11 +4015,14 @@ mod tests {
     const NO_SUCH_PID: u32 = u32::MAX - 3;
 
     #[test]
-    fn a_gone_host_is_marked_exited_for_one_poll_then_the_row_disappears() {
-        // 用户 2026-09-15 裁定：**先标"已退出"，连续两轮确认后再移除** —— 一次误判只让
-        // 标签变一下，不会让一个活着的会话从界面上消失。
-        let d = tempdir("zombie");
-        let sessions = tempdir("zombie-sessions");
+    fn a_session_already_dead_when_first_seen_is_never_drawn() {
+        // 2026-09-23：**第一次见就已经死了**的会话，一帧都不画。
+        //
+        // 这是"启动头两三秒列出十几条早已退出的会话"（2026-09-21 记下的暖机遗留）的修复。
+        // 它跟下面那条 09-15 的裁定不冲突：那条宽限给的是"用户**已经在看**的行"，
+        // 而这里这一行本进程从来没画过 —— 没有"突然消失"可言，画出来只是噪声。
+        let d = tempdir("startup-zombie");
+        let sessions = tempdir("startup-zombie-sessions");
         let t = d.join("t.jsonl");
         fs::write(&t, "").unwrap();
         state_file_with_pid(&sessions, "dead", &t, Some(NO_SUCH_PID));
@@ -4011,12 +4034,48 @@ mod tests {
 
         let first =
             poll_once(&sessions, &mut deltas, &mut offsets, &mut dead_streak, &cfg, 2000);
-        assert_eq!(first.len(), 1, "第 1 轮**不能**移除，只标记（这是那条安全阀）");
-        assert!(first[0].host_gone, "第 1 轮必须标成已退出");
+        assert!(
+            first.is_empty(),
+            "第一次见就已经判死的会话不许出现在任何一帧里（含标记为'已退出'的那一帧）"
+        );
+        assert_eq!(dead_streak["dead"], 1, "streak 照常累计，回收节奏没变");
 
         let second =
             poll_once(&sessions, &mut deltas, &mut offsets, &mut dead_streak, &cfg, 2000);
-        assert!(second.is_empty(), "连续两轮确认之后才移除");
+        assert!(second.is_empty(), "之后也不许复活");
+        assert_eq!(dead_streak["dead"], 2);
+    }
+
+    #[test]
+    fn a_host_that_dies_while_we_watch_it_is_labelled_before_being_removed() {
+        // 用户 2026-09-15 裁定（**仍然有效的那一半**）：**已经画在屏幕上**的会话，宿主
+        // 消失时先标"已退出"，连续两轮确认后再移除 —— 一次误判只让标签变一下，
+        // 不会让一个活着的会话从界面上消失。
+        //
+        // "已经画过"的造法：先给一份 `claude_pid = None` 的文件（= 不做判定 ⇒ 照常画），
+        // 再把 pid 换成不存在的 —— 这一轮才是"看着它死的"。
+        let d = tempdir("watched");
+        let sessions = tempdir("watched-sessions");
+        let t = d.join("t.jsonl");
+        fs::write(&t, "").unwrap();
+        state_file(&sessions, "watched", &t);
+
+        let cfg = config::Config::default();
+        let mut deltas = HashMap::new();
+        let mut offsets = HashMap::new();
+        let mut dead_streak = HashMap::new();
+
+        let first = poll_once(&sessions, &mut deltas, &mut offsets, &mut dead_streak, &cfg, 2000);
+        assert_eq!(first.len(), 1, "没有 pid ⇒ 不判定 ⇒ 照常画（这是那半条安全阀的前提）");
+        assert!(!first[0].host_gone);
+
+        state_file_with_pid(&sessions, "watched", &t, Some(NO_SUCH_PID));
+        let second = poll_once(&sessions, &mut deltas, &mut offsets, &mut dead_streak, &cfg, 2000);
+        assert_eq!(second.len(), 1, "已经画过的会话：第 1 轮**不能**移除，只标记");
+        assert!(second[0].host_gone, "第 1 轮必须标成已退出");
+
+        let third = poll_once(&sessions, &mut deltas, &mut offsets, &mut dead_streak, &cfg, 2000);
+        assert!(third.is_empty(), "连续两轮确认之后才移除");
     }
 
     #[test]
