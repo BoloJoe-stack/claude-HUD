@@ -38,9 +38,19 @@ impl HookPayload {
     }
 }
 
-/// 抓一次本进程的 Claude Code 宿主，**顺带**问一句"宿主之上还有没有第二个 claude.exe"
-/// （= 本会话是不是另一个会话拉起来的子会话，9b 的落地 + 2026-09-18 的子会话判据）。
-/// 返回 `(宿主 pid, 上一层宿主)`。一次快照回答两个问题，第二问**零额外 syscall**。
+/// 一次抓到的宿主事实：**是谁**（pid）、**它上面还有没有另一个宿主**（子会话判据）、
+/// **它的创建时间**（身份，防 pid 回收）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostCapture {
+    pid: u32,
+    above: Option<u32>,
+    start: Option<u64>,
+}
+
+/// 抓一次本进程的 Claude Code 宿主，**顺带**问两件事："宿主之上还有没有第二个 claude.exe"
+/// （= 本会话是不是另一个会话拉起来的子会话，9b 的落地 + 2026-09-18 的子会话判据）、
+/// 以及"宿主的创建时间"（2026-09-23 的身份判据）。一次快照回答前两问，第三问**同一个
+/// 句柄再加一次廉价调用**（微秒级）。
 ///
 /// ## 抓的时机
 ///
@@ -58,11 +68,94 @@ impl HookPayload {
 /// 拿不到就返回 `None`（**不猜**），调用方保留原值。挂件侧对"没有 pid"的处理是
 /// "不做僵尸判定" —— 退回改造前的行为。**宁可漏报僵尸，不可误杀活人。**
 ///
-/// 子会话那半的判据与真机形态见 `procinfo::host_and_parent`。
-fn capture_hosts() -> Option<(u32, Option<u32>)> {
+/// 子会话那半的判据与真机形态见 `procinfo::host_and_parent`；
+/// 创建时间那半见 [`crate::state::SessionState::claude_start`]。
+fn capture_hosts() -> Option<HostCapture> {
     let me = unsafe { procinfo::GetCurrentProcessId() };
     let table = procinfo::snapshot().ok()?;
-    procinfo::host_and_parent(&table, me, procinfo::HOST_EXE)
+    let (pid, above) = procinfo::host_and_parent(&table, me, procinfo::HOST_EXE)?;
+    // 创建时间取不到就记 `None`（**不猜**，也不拦着这次抓捕）：状态文件退回"只看 pid +
+    // 映像名"的老判据 —— 宁可漏报僵尸，不可误杀活人。
+    let start = procinfo::start_time(pid);
+    Some(HostCapture { pid, above, start })
+}
+
+/// 把一次抓捕的结果并进旧值：**三个字段整组换，或者整组不动**。
+///
+/// 抓不到（`captured == None`）时三条**原样保留**——与 [`capture_hosts`] 的"不猜"一致。
+///
+/// ## 为什么必须整组（这条比它看起来重要）
+///
+/// `pid` 与 `start` 是**同一个事实的两半**：一个 pid 配**另一个进程**的创建时间，会让
+/// [`crate::ui`] 的存活判定把**活着的**会话判成已退出（pid 对得上、时间对不上 ⇒ 判死）。
+/// 所以"新 pid + 旧时间"这种半新半旧的写法是**唯一会伤到真会话**的写法，此处用返回
+/// 三元组一次写清、并由 `merge_host_is_all_or_nothing` 钉住。
+fn merge_host(
+    captured: Option<HostCapture>,
+    prev: (Option<u32>, Option<bool>, Option<u64>),
+) -> (Option<u32>, Option<bool>, Option<u64>) {
+    match captured {
+        Some(h) => (Some(h.pid), Some(h.above.is_some()), h.start),
+        None => prev,
+    }
+}
+
+// ---- 僵尸状态文件的清扫（2026-09-23）-----------------------------------------
+
+/// 清扫前先等这么久：宿主进程已经消失、且**最后一条事件也早于**这个时长的状态文件才算僵尸。
+///
+/// 为什么要等：hook 全是 `async: true`，一个刚结束的会话可能还有事件在写途中；而且挂件
+/// 自己就会在连续两轮（约 2 s）内把"已退出"的行撤掉 —— 文件在那一小会儿里没有任何用处。
+/// 一小时是个**保守**值：清扫只负责"别让僵尸无界堆积"，不负责抢那几秒钟。
+const SWEEP_GRACE_SECS: i64 = 3600;
+
+/// 宿主**确已不在**吗？（与挂件侧 `ui::host_is_gone` 同一条判据、同一个取向。）
+///
+/// 只有拿到**正面证据**才回答 `true`：pid 不存在、或那个号上跑的是别的程序、或创建时间
+/// 对不上。`claude_pid` 为 `None`（老文件 / 没抓到）时一律 `false` —— **不判定**。
+/// 判不准（权限不足等）时 [`procinfo::alive`] 已经判活，所以这里也不会误删。
+///
+/// `exe_name` 是参数而不是写死 `procinfo::HOST_EXE`，理由与 `ui::host_is_gone` 那条一样：
+/// **让这条判据在单测里走得到身份那一级**（测试进程不叫 `claude.exe`）。
+fn confirmed_dead(s: &SessionState, exe_name: &str) -> bool {
+    match s.claude_pid {
+        None => false,
+        Some(pid) => !procinfo::alive(pid, exe_name, s.claude_start),
+    }
+}
+
+/// 删掉"确认已死且已经静了很久"的状态文件，返回删掉的份数。
+///
+/// ## 为什么由 hook 干这件事
+///
+/// **挂件绝不写状态文件**（Ruling #6：一个状态文件只能有一个写者）—— 删也是写。hook 本来
+/// 就是这些文件唯一的写者（`state::save_atomic` / `state::delete`），清扫放在它这里，
+/// 那条边界一条都不用破。
+///
+/// ## 为什么必须有这件事
+///
+/// 没有清扫，状态文件只增不减：用户盘上此刻就有 15 份宿主早已退出的僵尸文件（其中 4 份是
+/// 09-18 那次实验的子会话，标题 `estimate.rs 成本模块…`）。僵尸本身只是脏，**但它配上
+/// pid 回收就会冒到桌面上** —— 2026-09-23 用户报的"凭空冒出一个会话"就是这么来的
+/// （现场见 `docs/工作日志.md` 2026-09-23 那节）。`claude_start` 让复活**判得出来**，
+/// 清扫让这些文件**根本不再留在盘上**：两道一起上，才算把这条账收了。
+///
+/// 只在 `SessionStart` 调（每会话一次）：它要读一遍状态目录、对每份文件开一次进程句柄，
+/// 都是微秒级，但没理由放进每个事件。
+fn sweep_dead(dir: &Path, now: i64, exe_name: &str) -> usize {
+    let mut removed = 0;
+    for s in state::list_all(dir) {
+        if now.saturating_sub(s.last_event_at) < SWEEP_GRACE_SECS {
+            continue;
+        }
+        if !confirmed_dead(&s, exe_name) {
+            continue;
+        }
+        if state::delete(dir, &s.session_id).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// 这一轮该不该去抓宿主（纯函数，理由都写在下面，好单独钉住）。
@@ -84,13 +177,41 @@ fn should_capture(event: &str, prev_pid: Option<u32>) -> bool {
     event == "SessionStart" || prev_pid.is_none()
 }
 
+/// 抓宿主的那个动作。**注入**是为了让"写盘"这一段在单测里也走得到 ——
+/// 见 `handle_with` 的注释（与 `cursor::screen_pos` 同一个手法）。
+type HostProbe = dyn Fn() -> Option<HostCapture>;
+
 pub fn handle(
     p: &HookPayload,
     sessions_dir: &Path,
     cfg: &Config,
     now: i64,
 ) -> std::io::Result<()> {
+    handle_with(p, sessions_dir, cfg, now, &capture_hosts)
+}
+
+/// `handle` 的本体，宿主怎么抓由调用方给。
+///
+/// 生产走 [`capture_hosts`]（真去枚举进程表）。测试注入一个**假的** `HostCapture` ——
+/// 否则单测里永远抓不到宿主（`cargo` 起的测试进程上面没有 `claude.exe`），于是**写盘那几行
+/// 一行都测不到**：`claude_start` 忘了写进 `next`、或者写成"新 pid 配旧时间"，测试
+/// 照样全绿，而线上挂件会把**活着的**会话判死。这类"接线错了没人发现"的洞，
+/// 本项目已经栽过（`a_long_name_never_runs_into_the_right_group` 那轮的账）。
+fn handle_with(
+    p: &HookPayload,
+    sessions_dir: &Path,
+    cfg: &Config,
+    now: i64,
+    capture: &HostProbe,
+) -> std::io::Result<()> {
     let existing = state::load_one(sessions_dir, &p.session_id);
+
+    // 清扫僵尸状态文件，只在 `SessionStart` 做一次（见 `sweep_dead`）。
+    // 放在读 `existing` 之后：本会话自己的文件此刻若还是**上一轮**的残留（resume），
+    // 它同样该被扫掉 —— 反正下面会把它整份重写。
+    if p.hook_event_name == "SessionStart" {
+        sweep_dead(sessions_dir, now, procinfo::HOST_EXE);
+    }
 
     let current = existing
         .as_ref()
@@ -110,6 +231,7 @@ pub fn handle(
         transcript_path: None,
         display_name: None,
         claude_pid: None,
+        claude_start: None,
         nested: None,
         state: State::Idle.as_str().to_string(),
         state_since: now,
@@ -120,17 +242,19 @@ pub fn handle(
         transcript_offset: 0,
     });
 
-    // 9b：宿主 pid 与"是不是子会话"在 `SessionStart` 抓一次，其余事件沿用（缺 pid 时补抓）。
-    // 见 `capture_hosts` / `should_capture`。
-    let (claude_pid, nested) = if should_capture(&p.hook_event_name, prev.claude_pid) {
-        match capture_hosts() {
-            Some((host, above)) => (Some(host), Some(above.is_some())),
-            // 抓不到就**原样保留**两条旧值 —— 宁可漏报，不可误判（见 `capture_hosts` 的注释）
-            None => (prev.claude_pid, prev.nested),
-        }
+    // 9b：宿主 pid、宿主之上有没有第二个 claude、以及宿主的创建时间，都在 `SessionStart`
+    // 抓一次，其余事件沿用（缺 pid 时补抓）。见 `capture_hosts` / `merge_host` /
+    // `should_capture`。
+    let captured = if should_capture(&p.hook_event_name, prev.claude_pid) {
+        capture()
     } else {
-        (prev.claude_pid, prev.nested)
+        None
     };
+    // 抓不到就**原样保留**（含创建时间）—— 宁可漏报，不可误判（见 `capture_hosts` 的注释）
+    let (claude_pid, nested, claude_start) = merge_host(
+        captured,
+        (prev.claude_pid, prev.nested, prev.claude_start),
+    );
 
     let next = SessionState {
         session_id: p.session_id.clone(),
@@ -142,6 +266,7 @@ pub fn handle(
             .or(prev.transcript_path.clone()),
         display_name: prev.display_name.clone(),
         claude_pid,
+        claude_start,
         nested,
         state: t.state.as_str().to_string(),
         // 只在状态真的变化时重置计时，否则计时器会被无关事件反复清零
@@ -265,6 +390,34 @@ mod capture_tests {
             assert!(should_capture(ev, None), "{ev}：缺 pid 时必须补抓");
         }
     }
+
+    #[test]
+    fn merge_host_is_all_or_nothing() {
+        // 抓到 ⇒ **三个字段整组换新**；抓不到 ⇒ **整组原样保留**。
+        //
+        // 半新半旧（新 pid 配旧创建时间）是这套判据唯一能伤到**真会话**的写法：挂件那边
+        // 会判"pid 在、但不是我记的那个进程"，于是一个活着的会话被标成已退出、两轮后从
+        // 界面上消失。所以这条用例盯的是"有没有人把某一条路径写成了各更各的"。
+        let prev = (Some(111), Some(false), Some(999));
+        assert_eq!(merge_host(None, prev), prev, "抓不到 ⇒ 一个字段都不许动");
+
+        let got = merge_host(
+            Some(HostCapture { pid: 222, above: Some(333), start: Some(888) }),
+            prev,
+        );
+        assert_eq!(got, (Some(222), Some(true), Some(888)), "抓到 ⇒ 整组换成新的");
+
+        // 同上，但 `above` 为空（用户自己开的会话）且创建时间没取到：三个字段仍然一起动。
+        let got = merge_host(
+            Some(HostCapture { pid: 444, above: None, start: None }),
+            prev,
+        );
+        assert_eq!(
+            got,
+            (Some(444), Some(false), None),
+            "取不到创建时间也要整组换 —— 留着旧时间就变成'新 pid 配旧时间'"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +442,193 @@ mod handle_tests {
         p.last_assistant_message = msg.map(str::to_string);
         p.transcript_path = Some("C:\\t.jsonl".into());
         p
+    }
+
+    /// 一个**不可能存在**的 pid：Windows 的 pid 是 4 的倍数，且远小于 `u32::MAX`。
+    /// （`ui.rs` 里那条僵尸用例用的是同一个手法。）
+    const NO_SUCH_PID: u32 = u32::MAX - 3;
+
+    /// 写一份状态文件，只指定清扫关心的那几个字段。
+    fn write(dir: &Path, id: &str, pid: Option<u32>, start: Option<u64>, last_event_at: i64) {
+        let s = SessionState {
+            session_id: id.into(),
+            cwd: "D:\\w".into(),
+            transcript_path: None,
+            display_name: None,
+            claude_pid: pid,
+            claude_start: start,
+            nested: Some(false),
+            state: "done".into(),
+            state_since: last_event_at,
+            last_event: "Stop".into(),
+            last_event_at,
+            last_assistant_message: None,
+            notification_message: None,
+            transcript_offset: 0,
+        };
+        state::save_atomic(dir, &s).unwrap();
+    }
+
+    /// 本测试二进制的映像名（清扫的身份判据要拿真名去比，见 `confirmed_dead`）。
+    fn my_exe_name() -> String {
+        std::env::current_exe()
+            .expect("测试二进制必然有路径")
+            .file_name()
+            .expect("必然有文件名")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn remaining(dir: &Path) -> Vec<String> {
+        let mut ids: Vec<String> = state::list_all(dir).into_iter().map(|s| s.session_id).collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn sweep_removes_only_files_whose_host_is_confirmed_gone() {
+        // 2026-09-23 的账：状态文件只增不减，而僵尸配 pid 回收就会冒到桌面上。
+        // 这条用例把"什么该删、什么绝不能删"一次全钉住。
+        //
+        // 拿**本测试进程**当"活着的宿主"：真 pid、真创建时间，所以创建时间那一级在单测里
+        // 也走得到（测试进程的映像名不是 claude.exe，故 exe 名由 `my_exe_name` 给）。
+        const NOW: i64 = 1_800_000_000;
+        const LONG_AGO: i64 = NOW - 86_400;
+        let d = tempdir("sweep");
+        let me = std::process::id();
+        let exe = my_exe_name();
+        let real = procinfo::start_time(me).expect("本进程必须有创建时间");
+
+        write(&d, "alive", Some(me), Some(real), LONG_AGO); // 宿主还在（身份也对） → 留
+        write(&d, "alive-oldfile", Some(me), None, LONG_AGO); // 老文件没记创建时间 → 留
+        write(&d, "no-pid", None, None, LONG_AGO); // 不判定 → 留
+        write(&d, "dead", Some(NO_SUCH_PID), None, LONG_AGO); // 宿主进程没了 → 删
+        write(&d, "recycled", Some(me), Some(real + 1), LONG_AGO); // **僵尸复活那条路** → 删
+        write(&d, "fresh-dead", Some(NO_SUCH_PID), None, NOW - 60); // 刚结束，还在宽限期 → 留
+
+        let removed = sweep_dead(&d, NOW, &exe);
+        assert_eq!(removed, 2, "只该删两份（dead 与 recycled）");
+        assert_eq!(
+            remaining(&d),
+            vec!["alive", "alive-oldfile", "fresh-dead", "no-pid"],
+            "活着的、老格式的、没 pid 的、刚结束的 —— 一份都不许动"
+        );
+    }
+
+    #[test]
+    fn the_sweep_reads_a_wrong_image_name_as_evidence_not_as_ignorance() {
+        // 两种"看起来都没结论"的形态，处理**正好相反**（口径来自 `procinfo::alive`）：
+        //
+        // - 那个 pid 上跑着**别的程序** → **正面证据**：宿主确实没了 ⇒ 清扫**必须**删；
+        // - 根本**问不出来**（权限不足、调用失败）→ 没有证据 ⇒ 判活 ⇒ 不许删。
+        //
+        // 谁把前者也归进"判不准"里跳过，僵尸就永远清不掉；谁把后者当成"确实死了"，
+        // 就会把活着的会话连文件一起删掉。同一个 pid、同一个文件，只用**不同的 exe 名**
+        // 去判，结论必须相反 —— 这条区别就在这一个断言里。
+        //
+        // （"问不出来"那一支没法在这里稳定构造：它要求拿到一个**存在但打不开**的 pid。
+        // 真机上就是系统进程那种情形，见 `procinfo::alive` 里 ERROR_ACCESS_DENIED 那段。）
+        const NOW: i64 = 1_800_000_000;
+        let d = tempdir("sweep-exe-name");
+        let me = std::process::id();
+        let exe = my_exe_name();
+        write(&d, "live-host", Some(me), None, NOW - 86_400);
+
+        assert_eq!(sweep_dead(&d, NOW, &exe), 0, "名字对得上、进程还在 ⇒ 不许删");
+        assert_eq!(remaining(&d), vec!["live-host"]);
+
+        assert_eq!(
+            sweep_dead(&d, NOW, "definitely-not-this.exe"),
+            1,
+            "映像名不符 = 那个号上是别的程序 = 确认已死 ⇒ 必须删"
+        );
+        assert!(remaining(&d).is_empty());
+    }
+
+    #[test]
+    fn the_sweep_runs_only_on_session_start() {
+        // 清扫要读一遍状态目录、对每份文件开一次进程句柄 —— 都是微秒级，但没理由放进
+        // 每个事件（hook 每轮还要跑上百次）。这条用例钉住"只有 SessionStart 会清"。
+        let d = tempdir("sweep-event");
+        let me = std::process::id();
+        let real = procinfo::start_time(me).expect("本进程必须有创建时间");
+
+        // 一份确认已死的僵尸：pid 真实存在，但**创建时间对不上** ⇒ 就是被回收的号。
+        write(&d, "zombie", Some(me), Some(real + 1), 1000);
+
+        // 非 SessionStart 的事件：不许清（这里连状态文件都还在）
+        for ev in ["UserPromptSubmit", "Stop", "Notification"] {
+            handle(&payload(ev, None, None), &d, &Config::default(), 1_800_000_000).unwrap();
+            assert_eq!(
+                remaining(&d),
+                vec!["s1", "zombie"],
+                "{ev}：只有 SessionStart 才清扫（这份僵尸必须还在）"
+            );
+        }
+
+        handle(&payload("SessionStart", None, None), &d, &Config::default(), 1_800_000_000)
+            .unwrap();
+        assert_eq!(remaining(&d), vec!["s1"], "SessionStart 必须把它清掉");
+    }
+
+    #[test]
+    fn session_start_writes_the_host_identity_and_later_events_keep_it() {
+        // **写盘那一段**（单测里抓不到真宿主，所以注入一个假的）：`SessionStart` 抓到的
+        // (pid, 创建时间, 是不是子会话) 必须**三个一起**落进状态文件；之后的事件不再抓
+        // （省那 7.5 ms），但也**一个都不许丢**。
+        let d = tempdir("capture-write");
+        let cfg = Config::default();
+        let first = || Some(HostCapture { pid: 4242, above: None, start: Some(777) });
+        handle_with(&payload("SessionStart", None, None), &d, &cfg, 1000, &first).unwrap();
+
+        let s = state::load_one(&d, "s1").unwrap();
+        assert_eq!(s.claude_pid, Some(4242), "宿主的 pid 必须落盘");
+        assert_eq!(s.claude_start, Some(777), "创建时间必须与 pid 一起落盘");
+        assert_eq!(s.nested, Some(false), "`above` 为空 ⇒ 用户自己开的");
+
+        // 第二个会话是**子会话**（上面压着另一个 claude.exe）：三态那一路也要走通。
+        let child = || Some(HostCapture { pid: 5001, above: Some(4900), start: Some(888) });
+        let d2 = tempdir("capture-write-child");
+        handle_with(&payload("SessionStart", None, None), &d2, &cfg, 1000, &child).unwrap();
+        assert_eq!(state::load_one(&d2, "s1").unwrap().nested, Some(true));
+
+        // 后续事件不抓（`should_capture` 为 false ⇒ 注入的假抓手**根本不会被调用**），
+        // 但两个字段必须原样躺在盘上。
+        let boom = || panic!("已经有 pid 的会话不该再抓宿主");
+        handle_with(&payload("UserPromptSubmit", None, None), &d, &cfg, 1100, &boom).unwrap();
+        let s = state::load_one(&d, "s1").unwrap();
+        assert_eq!((s.claude_pid, s.claude_start), (Some(4242), Some(777)));
+    }
+
+    #[test]
+    fn a_renewed_host_replaces_both_halves_of_the_identity() {
+        // `SessionStart` 会因为 **resume** 再来一次，那时宿主可能换了进程。
+        // 要求：pid 与创建时间**成对更新** —— 绝不许出现"新 pid 配旧创建时间"，
+        // 那是这套判据唯一能伤到**真会话**的写法（挂件会把活着的会话判成已退出）。
+        let d = tempdir("capture-renew");
+        let cfg = Config::default();
+        let first = || Some(HostCapture { pid: 4242, above: None, start: Some(777) });
+        handle_with(&payload("SessionStart", None, None), &d, &cfg, 1000, &first).unwrap();
+
+        let renewed = || Some(HostCapture { pid: 5555, above: None, start: Some(888) });
+        handle_with(&payload("SessionStart", None, None), &d, &cfg, 1200, &renewed).unwrap();
+
+        let s = state::load_one(&d, "s1").unwrap();
+        assert_eq!(
+            (s.claude_pid, s.claude_start),
+            (Some(5555), Some(888)),
+            "换了宿主 ⇒ 两半都换成新的（半新半旧会把真会话判死）"
+        );
+
+        // 反向：**抓不到**（进程表枚举失败 / 权限不足）⇒ 两半都原样保留。
+        let failed = || None;
+        handle_with(&payload("SessionStart", None, None), &d, &cfg, 1400, &failed).unwrap();
+        let s = state::load_one(&d, "s1").unwrap();
+        assert_eq!(
+            (s.claude_pid, s.claude_start),
+            (Some(5555), Some(888)),
+            "抓不到 ⇒ 整组保留，不许清空、也不许只清一半"
+        );
     }
 
     #[test]

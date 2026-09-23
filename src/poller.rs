@@ -116,6 +116,7 @@ mod tests {
             transcript_path: Some(transcript.to_string_lossy().to_string()),
             display_name: None,
             claude_pid: None,
+            claude_start: None,
             nested: None,
             state: "working".into(),
             state_since: 1000,

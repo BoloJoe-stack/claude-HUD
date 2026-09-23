@@ -12,6 +12,24 @@ pub struct SessionState {
     pub display_name: Option<String>,
     #[serde(default)]
     pub claude_pid: Option<u32>,
+    /// 宿主的**创建时间**（Win32 `FILETIME` 刻度，见 `procinfo::start_time`）。
+    ///
+    /// 与 `claude_pid` 是**同一个事实的两半**，由 hook 在 `SessionStart` 抓 pid 时顺手记下
+    /// （同一个句柄多一次廉价调用）。它存在的唯一理由是 **pid 会被 Windows 回收再发**：
+    /// 一个僵死会话的 pid 落到新的 `claude.exe` 头上时，只认 pid 与映像名的老判据会把那条
+    /// 死了很久的会话重新画到桌面上（2026-09-23 用户报的"凭空冒出一个显示成本模块
+    /// estimate.rs 的会话"，现场与探针见 `docs/工作日志.md`）。
+    ///
+    /// 三态与 `nested` 同样的口径：
+    ///
+    /// - `Some(t)` —— 记下了宿主的创建时间，存活判定必须**精确相等**。
+    /// - `None` —— **改造前写下的状态文件**（2026-09-23 之前没有这个字段），或当时取不到。
+    ///   退回老判据（只看 pid + 映像名）—— **宁可漏报僵尸，不可误杀活人**。
+    ///
+    /// ⚠️ 写的时候必须与 `claude_pid` **整组换**（见 `hook::merge_host`）：一个 pid 配另一个
+    /// 进程的创建时间，会把**活着的**会话判成已退出 —— 这是这套机制唯一会伤到真会话的写法。
+    #[serde(default)]
+    pub claude_start: Option<u64>,
     /// 这个会话**是不是被另一个 Claude 会话拉起来的**（`claude -p` 子进程）。
     ///
     /// 三态，因为"没这个字段"和"有、且为假"必须分得开：
@@ -127,6 +145,7 @@ mod tests {
             transcript_path: Some("C:\\Users\\user\\.claude\\projects\\x\\y.jsonl".into()),
             display_name: Some("示例项目报告排版修复".into()),
             claude_pid: Some(4242),
+            claude_start: Some(133_000_000_000_000_000),
             nested: Some(false),
             state: "working".into(),
             state_since: 1000,
@@ -147,6 +166,9 @@ mod tests {
         assert_eq!(back.session_id, "s1");
         assert_eq!(back.display_name.as_deref(), Some("示例项目报告排版修复"));
         assert_eq!(back.nested, Some(false), "三态字段必须原样往返");
+        // 创建时间是 u64（FILETIME 刻度），必须**一位不差**地往返：它判的是"就是同一个
+        // 进程"，任何精度损失都会让这个判据失效。
+        assert_eq!(back.claude_start, Some(133_000_000_000_000_000));
         // 中文路径必须原样往返（UTF-8 + JSON 转义）
         assert_eq!(back.cwd, "D:\\projects\\doc-tasks");
     }
@@ -156,6 +178,11 @@ mod tests {
         // 三态字段的兼容契约（2026-09-18 加 `nested`）：用户盘上此刻就有十几份
         // **没有这个字段**的状态文件，它们必须照旧读得出来，且读出来是 `None`
         // （= "没有这个事实"），不是 `Some(false)`（= "查过了，不是子会话"）。
+        //
+        // 2026-09-23 加 `claude_start` 时同一条契约再走一遍：**老文件必须照旧读得出、
+        // 且读成 `None`**（= 没有创建时间这个事实 ⇒ 存活判定退回老判据），绝不许
+        // 因为缺字段而解析失败，更不许被解析成 `Some(0)` 这种"有、但对不上"的值
+        // —— 那会把用户此刻正开着的老会话**全部判死**。
         //
         // 谁把 `#[serde(default)]` 去掉，这十几份文件就**当场解析失败**；而 `list_all`
         // 对坏文件是**静默跳过**的（见 `corrupt_file_is_skipped_not_fatal`）——
@@ -169,6 +196,10 @@ mod tests {
         assert_eq!(s.session_id, "old");
         assert_eq!(s.nested, None, "没有这个字段 ⇒ None，不是 Some(false)");
         assert_eq!(s.claude_pid, None);
+        assert_eq!(
+            s.claude_start, None,
+            "没有创建时间 ⇒ None（退回老判据），不是 Some(0)（那会判死真会话）"
+        );
         assert_eq!(list_all(&d).len(), 1, "老文件不能被当成坏文件跳掉");
     }
 

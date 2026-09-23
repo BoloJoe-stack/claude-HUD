@@ -663,7 +663,11 @@ fn poll_once(
     let mut gone: HashSet<String> = HashSet::new();
     for s in states.iter() {
         let streak = dead_streak.entry(s.session_id.clone()).or_insert(0);
-        *streak = if host_is_gone(s) { *streak + 1 } else { 0 };
+        *streak = if host_is_gone(s, procinfo::HOST_EXE) {
+            *streak + 1
+        } else {
+            0
+        };
         if *streak >= 1 {
             gone.insert(s.session_id.clone());
         }
@@ -682,9 +686,16 @@ fn poll_once(
 /// **宁可漏报僵尸，不可误杀活人。**
 ///
 /// "判不准"与"判为在"落在同一个分支，这是刻意的，理由见 `procinfo::alive` 的注释。
-fn host_is_gone(s: &state::SessionState) -> bool {
+///
+/// `exe_name` 是参数而不是写死 `HOST_EXE`，就为了一件事：**让这条判据在测试里能被钉住**。
+/// 测试进程的映像名不叫 `claude.exe`（`cargo` 编出来的测试二进制），写死的话"创建时间"
+/// 这一级在单测里**永远走不到** —— 于是"改了创建时间判据但没人发现"这种走样会一路绿灯。
+/// 生产调用点传的仍然是 [`procinfo::HOST_EXE`]。
+fn host_is_gone(s: &state::SessionState, exe_name: &str) -> bool {
     match s.claude_pid {
-        Some(pid) => !procinfo::alive(pid, procinfo::HOST_EXE),
+        // 创建时间是 2026-09-23 加的第二级（身份）：pid 会被 Windows 回收再发，
+        // 只认 pid + 映像名时，一个僵尸状态文件的号落到新的 claude.exe 头上就会复活。
+        Some(pid) => !procinfo::alive(pid, exe_name, s.claude_start),
         None => false,
     }
 }
@@ -2302,12 +2313,26 @@ mod tests {
         claude_pid: Option<u32>,
         nested: Option<bool>,
     ) {
-        let s = SessionState {
+        let s = session_state(session_id, transcript, claude_pid, nested, None);
+        crate::state::save_atomic(dir, &s).unwrap();
+    }
+
+    /// 造一个会话状态（不落盘），`claude_start` 由调用方给 —— 见
+    /// `a_recycled_pid_stops_being_the_host`：身份那一级只能拿真进程的创建时间来试。
+    fn session_state(
+        session_id: &str,
+        transcript: &Path,
+        claude_pid: Option<u32>,
+        nested: Option<bool>,
+        claude_start: Option<u64>,
+    ) -> SessionState {
+        SessionState {
             session_id: session_id.into(),
             cwd: "D:\\w".into(),
             transcript_path: Some(transcript.to_string_lossy().to_string()),
             display_name: None,
             claude_pid,
+            claude_start,
             nested,
             state: "working".into(),
             state_since: 1000,
@@ -2317,8 +2342,7 @@ mod tests {
             notification_message: None,
             // 盘上恒为 0：挂件不写状态文件（Ruling #6），所以 offset 只能靠内存复用
             transcript_offset: 0,
-        };
-        crate::state::save_atomic(dir, &s).unwrap();
+        }
     }
 
     // ---- 选字体（本任务唯一"必须单测"的纯逻辑）--------------------------------
@@ -4043,6 +4067,42 @@ mod tests {
         assert_eq!(dead_streak["rev"], 0, "宿主（或判定依据）回来了，streak 必须归零");
         assert_eq!(rows.len(), 1, "归零之后那一行必须留下");
         assert!(!rows[0].host_gone);
+    }
+
+    #[test]
+    fn a_recycled_pid_stops_being_the_host() {
+        // 第二级身份判据（2026-09-23）：pid 还在、但**不是当初那个进程** ⇒ 判"已退出"。
+        //
+        // 这条在 ui 层的价值不是复测 `procinfo::alive`（那边有真机用例），而是钉住**接线**：
+        // `host_is_gone` 必须把状态文件里的 `claude_start` 交给它。传 `None` 的话，
+        // 僵尸状态文件在 pid 被回收之后照样复活 —— 而那正是用户报的那个现象。
+        //
+        // 测试进程的映像名不叫 `claude.exe`，所以这里自己指定 exe 名（写死 `HOST_EXE` 的话
+        // 这条用例永远走不到身份那一级，见 `host_is_gone` 的注释）。
+        let exe = std::env::current_exe()
+            .expect("测试二进制必然有路径")
+            .file_name()
+            .expect("必然有文件名")
+            .to_string_lossy()
+            .to_string();
+        let me = std::process::id();
+        let real = procinfo::start_time(me).expect("本进程必须有创建时间");
+        let t = PathBuf::from("C:\\t.jsonl");
+
+        let good = session_state("good", &t, Some(me), Some(false), Some(real));
+        assert!(!host_is_gone(&good, &exe), "记的就是本进程的创建时间 ⇒ 宿主还在");
+
+        let recycled = session_state("recycled", &t, Some(me), Some(false), Some(real + 1));
+        assert!(
+            host_is_gone(&recycled, &exe),
+            "同一个 pid 上换了进程（创建时间对不上）⇒ 必须判已退出 —— 这就是那条僵尸复活的路"
+        );
+
+        let old = session_state("old", &t, Some(me), Some(false), None);
+        assert!(
+            !host_is_gone(&old, &exe),
+            "改造前写下的状态文件没有创建时间 ⇒ 退回老判据（判活），不许判死"
+        );
     }
 
     #[test]

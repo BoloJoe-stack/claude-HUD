@@ -156,18 +156,36 @@ fn image_name_matches(file: &str, exe_name: &str) -> bool {
     f.len() == e.len() || f[e.len()] == b'.'
 }
 
-/// `pid` 是否仍存活，**且映像名仍是 `exe_name`**（不区分大小写）。
+/// `pid` 是否仍存活，**映像名仍是 `exe_name`**，且（记了创建时间的话）**就是当初那个进程**。
 ///
-/// 两个条件缺一不可：只看 pid 存活会被 **pid 复用**骗到 —— Windows 会回收 pid，而挂件
-/// 把这个号记了很久，一个陌生进程占了同一个号就会被当成"宿主还活着"。带上映像名校验后，
-/// 复用者必须**同时也是同名的可执行文件**才会误判。
+/// ## 三个条件缺一不可
+///
+/// 只看 pid 存活会被 **pid 复用**骗到 —— Windows 会回收 pid 再发给别的进程，而状态文件里
+/// 那个号可能已经放了好几天。两级防护：
+///
+/// 1. **映像名校验**（2026-09-15）：复用者必须同时也是同名的可执行文件才会误判。
+/// 2. **创建时间校验**（2026-09-23）：`recorded_start` 是 hook 当初记下的宿主创建时间
+///    （[`start_time`]），它与 pid 是**同一个事实的两半**。同一个 pid 换了进程 ⇒ 创建时间
+///    必然不同 ⇒ 判"已退出"。这一级是 2026-09-23 那场"凭空冒出来的会话"直接换来的：
+///
+///    真实现场：状态目录里躺着 15 份宿主早已退出的僵尸文件（挂件不写状态文件 ⇒ 没人删），
+///    其中 4 份标题是 `estimate.rs 成本模块…`（09-18 那次 MCP token 实验的子会话）。
+///    只要 Windows 把其中一个 pid 发给**任何一个新的 `claude.exe`**，映像名校验就挡不住了，
+///    挂件当场把这条死了 5 天的会话当成真会话画出来 —— **状态 `待命`、计时还停在 5 天前**
+///    （探针复现：`%TEMP%\hudwatch\evidence\`，见 `docs/工作日志.md` 2026-09-23 那节）。
+///
+/// `recorded_start` 为 `None` 时**跳过**这一级（改造前写下的状态文件没有这个字段）——
+/// 退回 2026-09-23 之前的行为。
 ///
 /// ## 判不准时一律判"还活着"
 ///
-/// 取不到映像名（权限不足、调用失败）时我们**不知道**，此时返回 `true`。理由：
+/// 取不到映像名或创建时间（权限不足、调用失败）时我们**不知道**，此时返回 `true`。理由：
 /// 误判成"已退出"的后果是——先标错、两轮后**把这个会话从界面上抹掉**；而这是个帮人
 /// 看"谁还在跑"的工具，**最糟的错法就是让一个活着的会话消失**。宁可漏报僵尸，不可误杀活人。
-pub fn alive(pid: u32, exe_name: &str) -> bool {
+///
+/// ⚠️ 两条"不知道"的形状不一样，别混：**映像名不符**是**正面证据**（那是别的程序），
+/// 判死；**取不到创建时间**是没有证据，判活。
+pub fn alive(pid: u32, exe_name: &str, recorded_start: Option<u64>) -> bool {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
@@ -176,6 +194,8 @@ pub fn alive(pid: u32, exe_name: &str) -> bool {
             //   进程存在但**不让开**（更高完整性级别、系统进程）→ 它活着
             return GetLastError() == ERROR_ACCESS_DENIED;
         }
+        // 与映像名同一个句柄，多一次廉价调用（微秒级，见模块顶部那张表）
+        let actual_start = creation_ticks(h);
         let mut buf = [0u16; 512];
         let mut len = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
@@ -185,7 +205,49 @@ pub fn alive(pid: u32, exe_name: &str) -> bool {
         }
         let path = String::from_utf16_lossy(&buf[..len as usize]);
         let file = path.rsplit(['\\', '/']).next().unwrap_or(&path);
-        image_name_matches(file, exe_name)
+        if !image_name_matches(file, exe_name) {
+            return false; // 正面证据：同名号上跑的是别的程序
+        }
+        match (recorded_start, actual_start) {
+            (Some(rec), Some(act)) => rec == act,
+            // 没记（老文件）/ 取不到（判不准）→ 不拿这一级下结论
+            _ => true,
+        }
+    }
+}
+
+/// `pid` 的**创建时间**（Win32 `FILETIME` 刻度：自 1601-01-01 UTC 起的 100 ns 数）。
+///
+/// 给 hook 用：`SessionStart` 抓到宿主 pid 之后，顺手把它的创建时间一起记进状态文件
+/// （[`crate::state::SessionState::claude_start`]），挂件侧靠它把回收的 pid 认出来。
+/// 取不到就 `None`（**不猜**）—— 那时写下的状态文件退回"只看 pid + 映像名"的老判据。
+///
+/// 为什么存**原始刻度**而不是换算成秒：换算是单向有损的（两个不同的进程可能落在同一秒），
+/// 而这里要的是"**就是同一进程**"这个全等的判据，不是给人看的时间戳。
+pub fn start_time(pid: u32) -> Option<u64> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let t = creation_ticks(h);
+        let _ = CloseHandle(h);
+        t
+    }
+}
+
+/// 一个**已打开句柄**的进程创建时间（刻度）。失败返回 `None`。
+fn creation_ticks(h: *mut core::ffi::c_void) -> Option<u64> {
+    unsafe {
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        // 除 creation 外都是我们不看的出参，但 API 要求四个都给足空间。
+        if GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        Some(creation.ticks())
     }
 }
 
@@ -227,10 +289,36 @@ unsafe extern "system" {
         lp_exe_name: *mut u16,
         lpdw_size: *mut u32,
     ) -> i32;
+    fn GetProcessTimes(
+        h_process: *mut core::ffi::c_void,
+        lp_creation_time: *mut FileTime,
+        lp_exit_time: *mut FileTime,
+        lp_kernel_time: *mut FileTime,
+        lp_user_time: *mut FileTime,
+    ) -> i32;
 }
 
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 const INVALID_HANDLE_VALUE: isize = -1;
+
+/// `FILETIME`（minwinbase.h）：**两个 `DWORD`**，表示自 1601-01-01 UTC 起的 100 ns 刻度数。
+///
+/// 用它而不是自己拿 `[u32; 2]` 拼：这里和 `ProcessEntry32W` 是同一个理由 —— 结构布局
+/// 必须逐字对上 C 的定义，写成一个有名字的结构体，字段顺序就写在脸上。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FileTime {
+    /// 低 32 位。
+    lo: u32,
+    /// 高 32 位。
+    hi: u32,
+}
+
+impl FileTime {
+    fn ticks(self) -> u64 {
+        ((self.hi as u64) << 32) | self.lo as u64
+    }
+}
 
 /// 一次快照取回整个进程表。失败返回人话（调用方要把"测不出来"换成可读证据，所以这里
 /// 既不能 panic 也不能静默返回空表 —— 空表会被误读成"没有父进程"）。
@@ -432,8 +520,11 @@ mod tests {
             return;
         }
         for pid in &hosts {
+            // 真机上的宿主必然有创建时间；这里记下的就是它自己的，所以身份校验也必须过。
+            let start = start_time(*pid);
+            assert!(start.is_some(), "真在跑的进程必须有创建时间（pid {pid}）");
             assert!(
-                alive(*pid, HOST_EXE),
+                alive(*pid, HOST_EXE, start),
                 "pid {pid} 是真在跑的 {HOST_EXE}，`alive` 必须判为存活 —— \
                  否则线上每个会话都会被标成已退出"
             );
@@ -448,11 +539,51 @@ mod tests {
         let table = snapshot().expect("本机必须能取到进程表");
         let mine = table.iter().find(|p| p.pid == me).expect("快照里必须有本进程").name.clone();
 
-        assert!(alive(me, &mine), "自己必须被判为活着（这是 alive 的自检）");
-        // 映像名不匹配 → 不是"宿主"。pid 复用防护靠的就是这一条。
-        assert!(!alive(me, "definitely-not-this.exe"), "映像名不符时不能判为存活");
+        assert!(alive(me, &mine, None), "自己必须被判为活着（这是 alive 的自检）");
+        // 映像名不匹配 → 不是"宿主"。pid 复用防护的第一级靠的就是这一条。
+        assert!(
+            !alive(me, "definitely-not-this.exe", None),
+            "映像名不符时不能判为存活"
+        );
 
         // 一个几乎不可能存在的 pid：Windows 的 pid 是 4 的倍数、且远小于 u32::MAX。
-        assert!(!alive(u32::MAX - 3, "claude.exe"), "不存在的 pid 必须判为已退出");
+        assert!(
+            !alive(u32::MAX - 3, "claude.exe", None),
+            "不存在的 pid 必须判为已退出"
+        );
+    }
+
+    #[test]
+    fn a_recycled_pid_is_caught_by_the_creation_time() {
+        // **第二级防护（2026-09-23）**：pid 相同但**不是当初那个进程**时，必须判已退出。
+        //
+        // 这是"凭空冒出来的会话"的直接防线：僵尸状态文件里的 pid 被 Windows 发给了**新的**
+        // `claude.exe`，映像名这一级（第一级）当时挡不住，于是挂件把一条死了 5 天的会话
+        // 当成真会话画出来（现场与探针见 `docs/工作日志.md` 2026-09-23）。
+        //
+        // 拿真进程验：本进程的创建时间就是"记对了"的那一个。**必须精确相等**，不许
+        // "差得不多就算" —— 判据是"就是同一个进程"，不是"时间差不多"。
+        let me = unsafe { GetCurrentProcessId() };
+        let table = snapshot().expect("本机必须能取到进程表");
+        let mine = table.iter().find(|p| p.pid == me).expect("快照里必须有本进程").name.clone();
+
+        let start = start_time(me).expect("本进程必须有创建时间");
+        assert_eq!(start_time(me), Some(start), "同一个进程两次问必须给同一个时间");
+        assert!(alive(me, &mine, Some(start)), "记对了 → 活着");
+
+        assert!(
+            !alive(me, &mine, Some(start + 1)),
+            "创建时间对不上（差 1 个刻度也不行）⇒ pid 上是别的进程 ⇒ 必须判已退出"
+        );
+        assert!(
+            !alive(me, &mine, Some(start.wrapping_sub(1))),
+            "往回差一个刻度同样必须判已退出 —— 判据是相等，不是大小"
+        );
+
+        // 改造前写下的状态文件没有这个字段：不拿这一级下结论，退回老判据（判活）。
+        assert!(alive(me, &mine, None), "没记创建时间 ⇒ 不许判死（宁可漏报僵尸）");
+
+        // 不存在的 pid：连创建时间都问不出来。
+        assert_eq!(start_time(u32::MAX - 3), None, "不存在的 pid 必须给 None");
     }
 }
