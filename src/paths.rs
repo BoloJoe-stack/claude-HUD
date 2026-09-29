@@ -81,6 +81,20 @@ pub fn real_probe_enable_path() -> PathBuf {
     app_dir(&real_base()).join("ppid-probe.enable")
 }
 
+/// 通用诊断开关的**哨兵文件**：存在它 = 记诊断日志（见 `ui::drag_probe`）。
+///
+/// 与 `ppid-probe.enable` 分开是刻意的：那个开关会让 **hook** 每个事件都跑一次进程表
+/// 快照（贵），这个是挂件每轮记一行（便宜）。两个诊断不该互相绑架。
+pub fn real_diag_enable_path() -> PathBuf {
+    app_dir(&real_base()).join("diag.enable")
+}
+
+/// 通用诊断日志的落点。同 [`real_probe_path`] 的理由放在 app 目录，
+/// 而不是 `%TEMP%`（那是"临时垃圾"，这个是本应用自己的诊断产物）。
+pub fn real_diag_path() -> PathBuf {
+    app_dir(&real_base()).join("diagnostics.log")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

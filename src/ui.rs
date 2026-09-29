@@ -287,6 +287,15 @@ const MIN_INNER_WIDTH: f32 = 222.0;
 const MIN_INNER_HEIGHT: f32 = 160.0;
 
 pub fn run() -> eframe::Result<()> {
+    // 临时诊断：后台线程 panic 会**静默**（GUI 从 explorer 起，stderr 没人看）——
+    // 那正好会表现为"界面冻在某一帧"，所以先把它记进探针日志。
+    {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            diag_log(&format!("★ PANIC {info}"));
+            prev(info);
+        }));
+    }
     let cfg = config::load_from(&paths::real_config_path());
 
     // 中文字体**先探一次**（纯文件 IO，见 `pick_font`）。探测与安装分开，是因为
@@ -373,7 +382,7 @@ pub fn run() -> eframe::Result<()> {
                 worker: Some(worker),
                 last_pos: None,
                 pos_stable_since: None,
-                resizing: None,
+                dragging: None,
             }))
         }),
     )
@@ -696,6 +705,58 @@ fn poll_once(
     let mut rows = view::build_rows_with_deltas(&states, deltas, cfg, now);
     rows.retain(|r| dead_streak.get(&r.session_id).copied().unwrap_or(0) < 2);
     view::mark_host_gone(&mut rows, &gone);
+
+    // 诊断开关（默认关，见 `diag_log` 的头注释与 `paths::real_diag_enable_path`）。
+    //
+    // 记的是**每一条会话的"名字是从哪来的"**：`display_name`（转录里的 customTitle /
+    // aiTitle / firstPrompt）还是**兜底**（`cwd` 末段，记成 `<★文件夹名>`）；顺带把
+    // 判断这一步所需的旁证记上 —— `delta=`（本轮有没有吃到转录增量）、`tp=`（转录文件
+    // 在不在）、`off=/len=`（读到哪了）。用户 2026-09-29 报的"开很久的老会话标题变成
+    // 文件夹名"要靠它定位：那一刻只有这几种可能，而屏幕上它们长得一模一样。
+    //
+    // 只在**签名变了**（名字来源变了没有，**不含一直增长的 `len`**）或每 60 轮落盘一次，
+    // 否则这个文件一小时就能长到几十 MB。
+    if !rows.is_empty() {
+        static LAST_SIG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        static POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let mut line = format!("poll {} 行 |", rows.len());
+        let mut sig = String::new();
+        for s in states.iter() {
+            let dn = s.display_name.as_deref().filter(|n| !n.trim().is_empty());
+            let (ext, len) = match s.transcript_path.as_deref() {
+                None => ("无路径".to_string(), 0),
+                Some(p) => match std::fs::metadata(p) {
+                    Ok(m) => ("在".to_string(), m.len()),
+                    Err(_) => ("★缺".to_string(), 0),
+                },
+            };
+            let short = &s.session_id[..8.min(s.session_id.len())];
+            line.push_str(&format!(
+                " {short}=[{}|delta={}|tp={ext}|len={len}|off={}]",
+                dn.unwrap_or("<★文件夹名>"),
+                if deltas.contains_key(&s.session_id) { "Y" } else { "N" },
+                offsets.get(&s.session_id).copied().unwrap_or(0),
+            ));
+            sig.push_str(&format!(
+                "{short}|{}|{ext}|{},",
+                dn.is_some(),
+                deltas.contains_key(&s.session_id)
+            ));
+        }
+        let changed = LAST_SIG.lock().map(|mut l| {
+            let changed = *l != sig;
+            if changed {
+                *l = sig.clone();
+            }
+            changed
+        })
+        .unwrap_or(false);
+        if changed || n % 60 == 0 {
+            diag_log(&format!("{line}  [签名{}]", if changed { "变了" } else { "未变" }));
+        }
+    }
     rows
 }
 
@@ -768,14 +829,30 @@ fn spawn_poller(
     })
 }
 
-// ---- 窗口拖动 ----------------------------------------------------------------
-// `with_decorations(false)` 去掉了标题栏 → 系统不再提供任何可拖区域，
-// 不发 `ViewportCommand::StartDrag` 窗口就只能钉在原地。
+// ---- 窗口拖动 / 缩放（两件都"自己算"）---------------------------------------
+// `with_decorations(false)` 去掉了标题栏 → 系统不再提供任何可拖区域，也没有系统缩放热区。
 //
-// 为什么是这个 API：0.36 的 `ViewportBuilder` **没有** `with_draggable` 之类的
-// builder 开关（只有 `with_decorations`），可拖动性只能靠运行期发命令。
-// `StartDrag` 的文档明确要求"调用前左键必须刚按下"，所以在 `drag_started()`
-// 那一帧发正是时机（`drag_started` 只在拖拽开始的那一帧为真）。
+// ⚠️⚠️ **两条"交给窗口系统"的路都栽过，而且都栽在同一个失效模式上：命令发出去了、
+// 什么都没发生、也不报错。**
+//
+// 1. **缩放**（2026-09-17）：`ViewportCommand::BeginResize` 落到 winit 的
+//    `WM_NCLBUTTONDOWN(HT*)`，靠窗口的"非客户区"判可缩放性 —— 而无边框窗口正是把
+//    非客户区去掉换来的。命令发了、窗口不动。
+// 2. **拖动**（2026-09-29）：`ViewportCommand::StartDrag` → winit `drag_window()` →
+//    `WM_NCLBUTTONDOWN(HTCAPTION)`。这条路上有两道**静默**闸门：
+//    · `egui-winit` 处理这条命令的第一句是 `if window.has_focus()` —— 窗口没在前台
+//      就**直接丢掉**（源码：`egui-winit-0.36.2/src/lib.rs` 的 `StartDrag` 分支）；
+//    · winit 在 `handle_os_dragging` 里有个**一次性**标志：`if guard.dragging { return }`，
+//      只在收到 `WM_EXITSIZEMOVE` 时复位（源码：`winit-0.30.13`）。只要有一次没走到
+//      那一步，**之后所有拖动都被默默 `return` 掉，直到进程重启**。
+//    用户 2026-09-29 报的"以前能拖、后来拖不动"就是这个（真机证据：`config.json`
+//    的位置在当天 14:14 被写过，而窗口尺寸仍是默认 320×380 ⇒ 那次是**移动**不是缩放）。
+//
+// 所以移动也改成**自己算**：按下时记下窗口几何与光标屏幕坐标，之后每帧按光标位移
+// 直接发 `OuterPosition`。与缩放共用 [`DragSession`]，全程在手里、可单测、不会静默失效。
+//
+// 代价（有意取舍）：失去系统那套拖动附带的特性（Aero Snap、拖到标题栏双击最大化——
+// 本窗口本来也没有标题栏）。换来的是"要么动、要么有断言红着"。
 /// 边缘缩放热区的**带宽**（pt）。
 ///
 /// 无边框窗口（`with_decorations(false)`）**没有系统给的缩放热区**，得自己划。
@@ -784,10 +861,6 @@ fn spawn_poller(
 /// 而 6pt 那版还得往里凑一点才好命中）。
 const RESIZE_BORDER: f32 = 8.0;
 
-/// 指针 `p` 压在 `rect` 的哪条边/哪个角上；不在边缘带里返回 `None`。
-///
-/// 纯函数，所以能单测 —— 这是这一块唯一能自动验证的部分。**窗口真的被缩放**是发给
-/// 窗口系统的命令，只能人工验收（与拖动同理，见下面那条注释）。
 /// 位置稳定多久之后才回写配置（秒）。
 ///
 /// 拖拽过程中每帧都会变；不等它停下来就写，会在一次拖拽里产生几十次写盘。
@@ -822,6 +895,11 @@ fn window_rect(ui: &egui::Ui) -> egui::Rect {
     ui.max_rect().expand(INNER_MARGIN as f32)
 }
 
+/// 指针 `p` 压在 `rect` 的哪条边/哪个角上；不在边缘带里返回 `None`（= 该走移动）。
+///
+/// 纯函数，所以能单测。**"窗口真的被移动/缩放了吗"仍要人工验收**（发出去的是窗口
+/// 系统要执行的几何命令，无头测试里没有人去执行它）—— 但那一步之前的一切
+/// （边带判定、位移换算、互斥、收敛）都钉在断言上。
 fn resize_direction_at(
     rect: egui::Rect,
     p: egui::Pos2,
@@ -852,10 +930,40 @@ fn resize_direction_at(
     }
 }
 
+// ═══ 诊断开关（默认关闭）═══════════════════════════════════════════════════
+//
+// 与 `probe.rs` 的**安静模式**同一套约定：存在哨兵文件就生效，删掉即失效 ——
+// 挂件是个长驻进程，"测一次"的代价不能是重启它。未启用时只多一次 `metadata`。
+//
+// 现在记三件事，都是为了回答**已经在真机上出现过、但还没定论**的报障：
+//
+// 1. **每轮会话名是从哪来的**（`poll_once` 末尾）。用户 2026-09-29 报"开很久的老会话
+//    标题变成文件夹名"，而那一刻的名只可能来自 `display_name`（转录里的 customTitle /
+//    aiTitle / firstPrompt）或**兜底**（`cwd` 末段）。记下 `delta=`（这一轮有没有吃到
+//    转录增量）、`tp=`（转录文件在不在）、`off=/len=`，出问题的那一轮就能一眼看出断在
+//    哪一环 —— 否则只能靠猜。
+// 2. **拖动起手是哪种**（`handle_window_drag`）：移动还是缩放。
+// 3. **后台线程 panic**（`run` 里装了钩子）：GUI 从 `explorer.exe` 起，stderr 没人看，
+//    一个 panic 掉的轮询线程与"界面正常但永远不更新"在屏幕上长得一模一样。
+fn diag_log(msg: &str) {
+    if std::fs::metadata(crate::paths::real_diag_enable_path()).is_err() {
+        return;
+    }
+    use std::io::Write as _;
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crate::paths::real_diag_path())
+        .and_then(|mut f| {
+            writeln!(f, "{} {}", chrono::Local::now().format("%H:%M:%S%.3f"), msg)
+        });
+}
+
 fn handle_window_drag(
     ui: &mut egui::Ui,
-    resize: &mut Option<ResizeSession>,
+    drag: &mut Option<DragSession>,
     cursor_screen: &dyn Fn() -> Option<egui::Vec2>,
+    left_button_down: &dyn Fn() -> bool,
 ) {
     // ⚠️⚠️ **必须关掉标签的"可选中"** —— 用户 2026-09-17 报"不能拖动"，根因就在这一行。
     //
@@ -919,76 +1027,87 @@ fn handle_window_drag(
         let dir = ctx
             .input(|i| i.pointer.press_origin())
             .and_then(|p| resize_direction_at(rect, p));
-        match dir {
-            Some(dir) => {
-                // **自己算缩放**，不发给窗口系统（见 `ResizeSession` 的注释）。
-                // 拿不到 `viewport()` 的几何时退回 egui 坐标的窗口矩形（原点 0,0）——
-                // 测试的无头环境就是这种情况；真实窗口里 `outer_rect` 是**屏幕坐标**，
-                // 那是 `OuterPosition` 需要的坐标系，所以就以它为准。
-                let (outer, inner) = ctx.input(|i| {
-                    (
-                        i.viewport().outer_rect.unwrap_or(rect),
-                        i.viewport().inner_rect.unwrap_or(rect),
-                    )
-                });
-                // 按下那一刻的光标**屏幕坐标**：优先向系统要（与窗口位置无关，见 `cursor` 模块）。
-                // 万一要不到（极少见），退回"窗口原点 + 指针窗口内坐标"——**按下这一刻窗口
-                // 确实还没动**，所以这个折算此刻是准的；之后每帧都会重新向系统要。
-                let pointer = cursor_screen().unwrap_or_else(|| {
-                    outer.min.to_vec2()
-                        + ctx.input(|i| i.pointer.press_origin()).unwrap_or_default().to_vec2()
-                });
-                *resize = Some(ResizeSession { dir, outer, inner, pointer });
-            }
-            // 从别处起手 → 拖动窗口。这条路走系统命令，**实测是好的**（用户能移动窗口）。
-            None => {
-                *resize = None;
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-        }
+        // 拿不到 `viewport()` 的几何时退回 egui 坐标的窗口矩形（原点 0,0）——
+        // 测试的无头环境就是这种情况；真实窗口里 `outer_rect` 是**屏幕坐标**，
+        // 那是 `OuterPosition` 需要的坐标系，所以就以它为准。
+        let (outer, inner) = ctx.input(|i| {
+            (
+                i.viewport().outer_rect.unwrap_or(rect),
+                i.viewport().inner_rect.unwrap_or(rect),
+            )
+        });
+        // 按下那一刻的光标**屏幕坐标**：优先向系统要（与窗口位置无关，见 `cursor` 模块）。
+        // 万一要不到（极少见），退回"窗口原点 + 指针窗口内坐标"——**按下这一刻窗口
+        // 确实还没动**，所以这个折算此刻是准的；之后每帧都会重新向系统要。
+        let pointer = cursor_screen().unwrap_or_else(|| {
+            outer.min.to_vec2()
+                + ctx.input(|i| i.pointer.press_origin()).unwrap_or_default().to_vec2()
+        });
+        // 贴边 → 缩放；其余 → **移动整个窗口**。两条都是我们自己算几何（见文件头那段），
+        // 所以这里只是在同一个快照上挑一个方向，没发任何"交给窗口系统"的命令。
+        let kind = match dir {
+            Some(dir) => DragKind::Resize(dir),
+            None => DragKind::Move,
+        };
+        diag_log(&format!("→ drag_started: {kind:?}")); // 诊断开关（默认关，见 `diag_log`）
+        *drag = Some(DragSession { kind, outer, inner, pointer });
     }
 
-    if let Some(session) = resize.as_mut() {
-        if response.dragged() {
+    if let Some(session) = drag.as_mut() {
+        // ⚠️ 结束条件里有**两条**：一条是事件（egui 说松手了），一条是**向系统要的事实**
+        // （左键此刻还按着吗）。前者会丢 —— 2026-09-29 合成输入实测到过：`WM_LBUTTONUP`
+        // 被 egui-winit 丢掉（那一步要求 `pointer_pos_in_points` 是 `Some`），于是
+        // egui 一直以为还按着、`dragged()` 恒真、**窗口会一直跟着光标跑**。
+        // 本仓坑 #9 的老教训：事件驱动的状态必须有一条证据驱动的兜底。
+        if response.dragged() && left_button_down() {
             // 拿不到光标就**这一帧什么都不做**（少发一帧命令无害；拿错数会把窗口推着跑）。
             if let Some(c) = cursor_screen() {
-                apply_resize(ui.ctx(), session, c);
+                apply_drag(ui.ctx(), session, c);
             }
-        } else if response.drag_stopped() || !response.is_pointer_button_down_on() {
-            *resize = None;
+        } else if response.drag_stopped() || !response.is_pointer_button_down_on() || !left_button_down()
+        {
+            *drag = None;
         }
     }
 }
 
-/// 一次手动缩放的起始快照（按下那一刻的窗口几何与指针位置）。
+/// 这一拖**要干什么**：搬窗口，还是从某条边/某个角缩放。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragKind {
+    /// 移动整个窗口（按在面板中间）。
+    Move,
+    /// 缩放（按在边缘带里）。
+    Resize(egui::viewport::ResizeDirection),
+}
+
+/// 一次"自己算"的窗口几何调整的起始快照（按下那一刻的窗口几何与指针位置）。
+/// 移动与缩放共用 —— 两者的位移换算**一模一样**，区别只在把位移加到哪几条边上。
 ///
-/// ## 为什么自己做，不用 `ViewportCommand::BeginResize`
+/// ## 为什么两件都自己做，不交给窗口系统
 ///
-/// 那条命令最后落到 winit 的 `drag_resize_window` → `WM_NCLBUTTONDOWN(HT*)`，
-/// **把控制权交给系统自己的缩放循环**。问题是它对**无边框窗口**并不可靠：
-/// 那个循环靠窗口的"非客户区"来判定可缩放性，而我们的窗口正是把非客户区去掉换来的无边框。
-/// 结果就是**命令发出去了、什么都没发生** —— 而且不报错。
-/// （本仓第三轮写下这条路时就注明"窗口真的被缩放只能人工验收"，**一直没有人验收过**；
-/// 2026-09-17 用户连着两次报"不能缩放"，就是它。）
+/// 见文件头那段：`BeginResize`（缩放）与 `StartDrag`（移动）都是"命令发出去、什么都没发生、
+/// 也不报错"的 API —— 前者靠"非客户区"判可缩放性，无边框窗口没有；后者有两道静默闸门
+/// （`window.has_focus()` + winit 的一次性 `dragging` 标志）。都栽在同一个失效模式上。
 ///
-/// 现在改成**每一帧按指针位移自己算**：读当前窗口矩形 + 指针位置，推出新的位置与尺寸，
-/// 再发 `OuterPosition` + `InnerSize`。全程在我们手里，而且**能被单测断言**
-/// （见 `dragging_the_edge_resizes_the_window_from_that_edge`）。
+/// 现在改成**每一帧按指针位移自己算**：按下时记下窗口矩形与光标位置，之后推出新的位置
+/// （移动）或位置+尺寸（缩放），再发 `OuterPosition`（+ `InnerSize`）。全程在我们手里，
+/// 而且**能被单测断言**（见 `dragging_the_edge_resizes_the_window_...` /
+/// `dragging_the_middle_moves_the_window_...`）。
 #[derive(Debug, Clone, Copy)]
-struct ResizeSession {
-    dir: egui::viewport::ResizeDirection,
+struct DragSession {
+    kind: DragKind,
     /// 按下那一刻的**外框**（屏幕坐标，egui 点）。
     outer: egui::Rect,
     /// 按下那一刻的**内框**（用来推算"外框比内框大多少"——描边/阴影，这里其实是 0）。
     inner: egui::Rect,
     /// 按下那一刻的指针（**屏幕坐标**）。
     ///
-    /// ⚠️ 必须存**屏幕坐标**而不是窗口内坐标：缩放会**移动窗口**（拖左边时原点跟着走），
-    /// 窗口内坐标会随之一跳，算出来的位移就是错的。
+    /// ⚠️ 必须存**屏幕坐标**而不是窗口内坐标：这两件事都会**移动窗口**（缩放的左/上边、
+    /// 以及移动本身都会让原点跟着走），窗口内坐标会随之一跳，算出来的位移就是错的。
     ///
     /// ⚠️⚠️ 而且**每一帧的光标位置都要重新向系统要一次**（[`cursor::screen_pos`]），
     /// 不能用 egui 手里那份"窗口内坐标 + 窗口原点"折算 —— 那条路会**正反馈**，
-    /// 见 [`apply_resize`] 的注释（2026-09-17 实测把窗口撑到 6582pt 宽后卡死）。
+    /// 见 [`apply_drag`] 的注释（2026-09-17 实测把窗口撑到 6582pt 宽后卡死）。
     pointer: egui::Vec2,
 }
 
@@ -1014,7 +1133,11 @@ struct ResizeSession {
 ///
 /// 拖**右/下缘**时窗口原点本来不动，这条回路不成立 —— 所以缺陷只在**会移动原点的边**
 /// （左/上，以及含它们的角）上发作，藏了很久。
-fn apply_resize(ctx: &egui::Context, session: &mut ResizeSession, cursor_now: egui::Vec2) {
+///
+/// ⚠️ **移动**（`DragKind::Move`）同样吃这条纪律：位移也一律从"按下时的几何 + 光标位移"
+/// 算出来，**绝不从当前窗口几何往回推** —— 否则同一个回路立刻出现（窗口每动一下，
+/// "它自己的位移"就被当成"鼠标又动了"）。这正是把移动与缩放收进同一个函数的原因。
+fn apply_drag(ctx: &egui::Context, session: &mut DragSession, cursor_now: egui::Vec2) {
     use egui::viewport::ResizeDirection as Dir;
     let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
     // 与 `handle_window_drag` 里取起点用的是同一套回退，两边必须一致
@@ -1022,18 +1145,30 @@ fn apply_resize(ctx: &egui::Context, session: &mut ResizeSession, cursor_now: eg
     let inner = inner.unwrap_or(session.inner);
     let d = cursor_now - session.pointer;
 
+    // ---- 移动：整块平移，尺寸不动 ----
+    if session.kind == DragKind::Move {
+        // 只发 `OuterPosition`。**不发 `InnerSize`** —— 尺寸没变，多发一条只会让窗口
+        // 在两帧之间被按一个多余的尺寸重设一次（会闪）。
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(session.outer.min + d));
+        return;
+    }
+
+    let DragKind::Resize(dir) = session.kind else {
+        unreachable!("上面已经处理过 Move")
+    };
+
     let mut min = session.outer.min;
     let mut max = session.outer.max;
-    if matches!(session.dir, Dir::West | Dir::NorthWest | Dir::SouthWest) {
+    if matches!(dir, Dir::West | Dir::NorthWest | Dir::SouthWest) {
         min.x += d.x;
     }
-    if matches!(session.dir, Dir::East | Dir::NorthEast | Dir::SouthEast) {
+    if matches!(dir, Dir::East | Dir::NorthEast | Dir::SouthEast) {
         max.x += d.x;
     }
-    if matches!(session.dir, Dir::North | Dir::NorthWest | Dir::NorthEast) {
+    if matches!(dir, Dir::North | Dir::NorthWest | Dir::NorthEast) {
         min.y += d.y;
     }
-    if matches!(session.dir, Dir::South | Dir::SouthWest | Dir::SouthEast) {
+    if matches!(dir, Dir::South | Dir::SouthWest | Dir::SouthEast) {
         max.y += d.y;
     }
 
@@ -1047,13 +1182,13 @@ fn apply_resize(ctx: &egui::Context, session: &mut ResizeSession, cursor_now: eg
     // 从**左/上边**拖时，右边/下边是钉住的，所以要把原点往回让；从右/下边拖则原点不动。
     if size.x < min_outer.x {
         size.x = min_outer.x;
-        if matches!(session.dir, Dir::West | Dir::NorthWest | Dir::SouthWest) {
+        if matches!(dir, Dir::West | Dir::NorthWest | Dir::SouthWest) {
             min.x = max.x - size.x;
         }
     }
     if size.y < min_outer.y {
         size.y = min_outer.y;
-        if matches!(session.dir, Dir::North | Dir::NorthWest | Dir::NorthEast) {
+        if matches!(dir, Dir::North | Dir::NorthWest | Dir::NorthEast) {
             min.y = max.y - size.y;
         }
     }
@@ -1914,10 +2049,10 @@ struct App {
     /// 已经写进配置的位置 —— 用来判断"真的动了没有"，避免重复写盘。
     saved_pos: [f32; 2],
 
-    /// 正在进行的**手动缩放**（见 `ResizeSession`）。`None` = 没在缩。
+    /// 正在进行的**手动移动/缩放**（见 `DragSession`）。`None` = 没在拖。
     ///
     /// 状态必须跨帧存活：按下那一帧只记录起点，之后每一帧都要拿它换算新几何。
-    resizing: Option<ResizeSession>,
+    dragging: Option<DragSession>,
 }
 
 impl App {
@@ -1988,7 +2123,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(panel_frame())
             .show(ui, |ui| {
-                handle_window_drag(ui, &mut self.resizing, &cursor::screen_pos);
+                handle_window_drag(ui, &mut self.dragging, &cursor::screen_pos, &cursor::left_button_down);
                 draw_panel(ui, &snap.rows, &snap.ledger, snap.first_scan_done, &self.cfg);
             });
     }
@@ -2613,7 +2748,7 @@ mod tests {
             };
             let mut full = ctx.run_ui(raw, |ui| {
                 egui::CentralPanel::default().frame(panel_frame()).show(ui, |ui| {
-                    handle_window_drag(ui, &mut resizing, &src); // ← 与 `App::ui` 同一个调用点、同一层
+                    handle_window_drag(ui, &mut resizing, &src, &|| true); // ← 与 `App::ui` 同一个调用点、同一层
                     draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
                 });
             });
@@ -2639,6 +2774,20 @@ mod tests {
         cur.set(pos.x + drag.x, pos.y + drag.y);
         cmds.extend(frame(vec![egui::Event::PointerMoved(pos + drag)]));
         cmds
+    }
+
+    /// 一帧命令里**最后**那条 `OuterPosition`（按下帧那条是"原地不动"，带位移的在后面）。
+    fn last_outer(cmds: &[egui::ViewportCommand]) -> Option<egui::Pos2> {
+        cmds.iter().rev().find_map(|c| match c {
+            egui::ViewportCommand::OuterPosition(p) => Some(*p),
+            _ => None,
+        })
+    }
+
+    /// 一帧命令里**有没有**发 `InnerSize`（移动**不该**发；缩放必须发）。
+    fn sent_inner_size(cmds: &[egui::ViewportCommand]) -> bool {
+        cmds.iter()
+            .any(|c| matches!(c, egui::ViewportCommand::InnerSize(_)))
     }
 
     /// 一个**可以被测试推着走**的光标（屏幕坐标）。真实 `GetCursorPos` 在无头环境里
@@ -2706,7 +2855,7 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(panel_frame())
                         .show(ui, |ui| {
-                            handle_window_drag(ui, &mut resizing, &src);
+                            handle_window_drag(ui, &mut resizing, &src, &|| true);
                             draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
                         });
                 });
@@ -2976,10 +3125,12 @@ mod tests {
     /// 少了它，把 `selectable_labels` 改回默认（或有人"顺手"恢复文字选中）不会有人发现。
     #[test]
     fn pressing_on_text_still_drags_the_window() {
-        let cmds = commands_after_press_at(egui::pos2(40.0, 16.0), 320.0, 360.0);
-        assert!(
-            cmds.iter().any(|c| matches!(c, egui::ViewportCommand::StartDrag)),
-            "按在文字上必须仍能拖动窗口（标签不许抢走拖拽）：{cmds:?}"
+        // 按在顶栏文字上、往右拖 20pt ⇒ 窗口原点也往右 20pt
+        let cmds = commands_after_drag_at(egui::pos2(40.0, 16.0), egui::vec2(20.0, 0.0), 320.0, 360.0);
+        assert_eq!(
+            last_outer(&cmds),
+            Some(egui::pos2(20.0, 0.0)),
+            "按在文字上必须仍能搬动窗口（标签不许抢走拖拽）：{cmds:?}"
         );
     }
 
@@ -3129,7 +3280,7 @@ mod tests {
             let mut resizing = None;
             let mut full = ctx.run_ui(raw, |ui| {
                 egui::CentralPanel::default().frame(panel_frame()).show(ui, |ui| {
-                    handle_window_drag(ui, &mut resizing, &|| Some(egui::Vec2::ZERO));
+                    handle_window_drag(ui, &mut resizing, &|| Some(egui::Vec2::ZERO), &|| true);
                     draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
                 });
             });
@@ -3140,19 +3291,31 @@ mod tests {
         frame(vec![egui::Event::PointerMoved(pos)])
     }
 
-    /// **反向对照**：从面板**中间**按下要拖动窗口，不能变成缩放。
+    /// **反向对照**：从面板**中间**按下要**搬窗口**，不能变成缩放。
     ///
-    /// 少了这条，把判定写成"一律 BeginResize"也能过 —— 那样窗口就再也拖不动了。
+    /// 少了这条，把判定写成"一律缩放"也能过 —— 那样窗口就再也拖不动了。
+    /// 断言的是发给窗口系统的几何：往右下拖 (30, 12) ⇒ 原点也走 (30, 12)、**尺寸一个数都不发**。
+    /// （移动只发 `OuterPosition`；一旦也跟着发 `InnerSize`，那就说明判成了缩放。）
     #[test]
     fn pressing_in_the_middle_drags_the_window_instead_of_resizing_it() {
-        let cmds = commands_after_press_at(egui::pos2(160.0, 180.0), 320.0, 360.0);
+        let cmds = commands_after_drag_at(
+            egui::pos2(160.0, 180.0),
+            egui::vec2(30.0, 12.0),
+            320.0,
+            360.0,
+        );
+        assert_eq!(
+            last_outer(&cmds),
+            Some(egui::pos2(30.0, 12.0)),
+            "中间按下应当把窗口整体搬走 (30,12)：{cmds:?}"
+        );
         assert!(
-            cmds.iter().any(|c| matches!(c, egui::ViewportCommand::StartDrag)),
-            "中间按下应当 StartDrag：{cmds:?}"
+            !sent_inner_size(&cmds),
+            "移动**不该**动尺寸（发了 InnerSize 就说明被当成缩放了）：{cmds:?}"
         );
         assert!(
             !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::BeginResize(_))),
-            "中间按下**不该**缩放（两者必须互斥，否则点边缘会同时拖动和缩放）：{cmds:?}"
+            "中间按下**不该**走系统缩放：{cmds:?}"
         );
     }
 
@@ -4419,22 +4582,25 @@ mod tests {
     }
 
     // ---- 窗口拖动 -------------------------------------------------------------
-    // 注：**窗口真的被移动**这一步只能人工验收（`StartDrag` 是发给窗口系统的命令）。
-    // 这里能自动验证的是它前面的那一环：拖拽手势是否真的落到了拖拽区上
-    // —— 用 egui 真实的命中测试跑，指针落在**标签上**也必须拿到 drag_started。
+    // 注：**窗口真的被移动**这一步只能人工验收（发出去的是窗口几何命令，无头环境里
+    // 没有窗口系统去执行它）。这里能自动验证的是它前面的那一环：拖拽手势是否真的落到了
+    // 拖拽区上 —— 用 egui 真实的命中测试跑，指针落在**标签上**也必须拿到 drag_started。
     #[test]
     fn drag_area_receives_a_drag_even_when_the_pointer_is_over_the_content() {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 240.0));
-        let frame = |events: Vec<egui::Event>| -> Vec<egui::ViewportCommand> {
+        // 光标要能被推着走：移动的位移**只**来自它（egui 的指针窗口内坐标不算数）
+        let cur = FakeCursor::new();
+        let src = cur.src();
+        let mut dragging = None;
+        let mut frame = |events: Vec<egui::Event>| -> Vec<egui::ViewportCommand> {
             let raw = egui::RawInput {
                 screen_rect: Some(screen),
                 events,
                 ..Default::default()
             };
-            let mut resizing = None;
             let mut full = ctx.run_ui(raw, |ui| {
-                handle_window_drag(ui, &mut resizing, &|| Some(egui::Vec2::ZERO));
+                handle_window_drag(ui, &mut dragging, &src, &|| true);
                 ui.label("中文会话名"); // 内容在拖拽区之后注册
             });
             full.textures_delta.clear(); // 不 clear 会 panic（见报告附录）
@@ -4443,28 +4609,34 @@ mod tests {
                 .map(|o| o.commands.clone())
                 .unwrap_or_default()
         };
-        let is_drag = |cmds: &Vec<egui::ViewportCommand>| {
-            cmds.iter().any(|c| matches!(c, egui::ViewportCommand::StartDrag))
-        };
 
         let pos = egui::pos2(60.0, 30.0); // 落在标签文字上
+        cur.set(pos.x, pos.y);
         frame(vec![]);
         frame(vec![egui::Event::PointerMoved(pos)]);
-        let down = frame(vec![egui::Event::PointerButton {
+        let down_cmds = frame(vec![egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
             pressed: true,
             modifiers: Default::default(),
         }]);
 
-        // 拖拽要越过阈值才算"开始"，所以按下之后还要移动
-        let mut cmds = down;
-        if !is_drag(&cmds) {
-            cmds = frame(vec![egui::Event::PointerMoved(
-                pos + egui::vec2(16.0, 0.0),
-            )]);
-        }
-        assert!(is_drag(&cmds), "按住并拖动必须发出 StartDrag：{cmds:?}");
+        // 拖拽要越过阈值才算"开始"，所以按下之后还要移动 —— 光标真的挪 16pt。
+        // ⚠️ 断言的是**位移**而不是绝对落点：这个夹具没有 `viewport_info`，
+        // 窗口矩形是"内容区外扩 8pt"推出来的（原点 −8,−8），写死绝对坐标会随
+        // 那边的边距改动而红，而红的理由与"标签抢不抢拖拽"无关。
+        let base = last_outer(&down_cmds).expect("按下那一帧应当就报了一次当前几何");
+        cur.set(pos.x + 16.0, pos.y);
+        let moved = last_outer(&frame(vec![egui::Event::PointerMoved(
+            pos + egui::vec2(16.0, 0.0),
+        )]))
+        .expect("移动帧必须报新几何");
+        assert_eq!(
+            moved - base,
+            egui::vec2(16.0, 0.0),
+            "指针压在标签上时，按住并拖动仍必须搬动窗口（实测位移 {:?}）",
+            moved - base
+        );
     }
 
     // ---- 窗口缩放 -------------------------------------------------------------
@@ -4498,21 +4670,210 @@ mod tests {
         assert_eq!(at(-40.0, 180.0), None, "离得太远也不算");
     }
 
-    /// **贴边按下不许变成"拖动窗口"**（两者互斥）。
+    /// **贴边按下不许变成"搬窗口"**（两种手势互斥）。
     ///
-    /// 这条原来断言的是"发出 `BeginResize`" —— 2026-09-17 改成自己做缩放之后，
-    /// 那条命令不再发；但**互斥**这个不变量仍然要守：贴边按下若同时发 `StartDrag`，
-    /// 窗口会一边被拖一边被缩。
+    /// ⚠️ 这条的判据在 2026-09-29 换了：移动与缩放现在**都不发系统命令**，区别只剩
+    /// "发不发 `InnerSize`" —— 移动是纯平移（只发 `OuterPosition`），缩放一定会改尺寸。
+    /// 所以**不能**用"有没有 `OuterPosition`"来分（两者都发），也不能再用
+    /// `StartDrag`（那条路已经删掉）。原来那条断言在改动后会**永远成立**（空断言比没有更坏）。
     #[test]
-    fn pressing_at_the_edge_does_not_start_a_window_drag() {
+    fn pressing_at_the_edge_resizes_instead_of_moving_the_window() {
         let cmds = commands_after_drag_at(egui::pos2(1.0, 180.0), egui::vec2(-14.0, 0.0), 320.0, 360.0);
         assert!(
-            !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::StartDrag)),
-            "贴边按下不该拖动窗口（那条路只给面板中间）：{cmds:?}"
+            sent_inner_size(&cmds),
+            "贴边按下应当缩放（必须发 InnerSize）：{cmds:?}"
         );
+        assert_eq!(
+            last_outer(&cmds),
+            // 左缘往左 14 ⇒ 原点左移 14、宽度 +14（右缘钉住）
+            Some(egui::pos2(-14.0, 0.0)),
+            "左缘缩放：原点应随左缘走、右缘不动：{cmds:?}"
+        );
+    }
+
+    /// **移动必须收敛**：光标在屏幕上不动时，窗口位置一帧都不许再变。
+    ///
+    /// 这条与 `resizing_from_the_left_edge_converges...` 是同一个事故的**移动版**：
+    /// 自己做几何时，只要位移的输入里混进"当前窗口位置"，移动就会自激（窗口一动，
+    /// "它自己的位移"又被当成"鼠标动了"）—— 而且**移动比缩放更容易中招**：
+    /// 它每帧都在改原点，等于把那个回路踩得最实的一条路。
+    ///
+    /// 夹具照实模拟两件事（同那条的老规矩）：**窗口系统真的按命令移动窗口**、
+    /// **egui 手里的指针窗口内坐标僵在旧值**。
+    #[test]
+    fn moving_converges_while_the_cursor_stands_still() {
+        let cjk = pick_font(&font_candidates()).map(|(_, bytes)| bytes);
+        let ctx = ctx_with_fonts(build_font_definitions(cjk));
+        let (w, h) = (320.0, 380.0);
+        let origin0 = egui::pos2(1000.0, 300.0);
+        // 光标钉死（屏幕坐标），全程不动
+        let cur = FakeCursor::new();
+        cur.set(origin0.x + 160.0, origin0.y + 180.0);
+        let src = cur.src();
+
+        let mut dragging = None;
+        let mut origin = origin0; // 窗口系统眼里的原点（被我们的命令推着走）
+        let mut seen: Vec<egui::Pos2> = Vec::new();
+
+        let mut frame =
+            |origin: egui::Pos2, events: Vec<egui::Event>| -> Vec<egui::ViewportCommand> {
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(w, h),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                raw.viewports.insert(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportInfo {
+                        outer_rect: Some(egui::Rect::from_min_size(origin, egui::vec2(w, h))),
+                        inner_rect: Some(egui::Rect::from_min_size(origin, egui::vec2(w, h))),
+                        ..Default::default()
+                    },
+                );
+                let mut full = ctx.run_ui(raw, |ui| {
+                    egui::CentralPanel::default()
+                        .frame(panel_frame())
+                        .show(ui, |ui| {
+                            handle_window_drag(ui, &mut dragging, &src, &|| true);
+                            draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
+                        });
+                });
+                full.textures_delta.clear();
+                full.viewport_output
+                    .get(&egui::ViewportId::ROOT)
+                    .map(|o| o.commands.clone())
+                    .unwrap_or_default()
+            };
+
+        // 在面板中间按下并拖 40pt，然后**按住不动**再跑 10 帧
+        let press = egui::pos2(160.0, 180.0);
+        frame(origin, vec![]);
+        frame(origin, vec![egui::Event::PointerMoved(press)]);
+        let mut apply = |cmds: Vec<egui::ViewportCommand>, origin: &mut egui::Pos2| {
+            if let Some(p) = last_outer(&cmds) {
+                *origin = p;
+            }
+        };
+        apply(
+            frame(
+                origin,
+                vec![egui::Event::PointerButton {
+                    pos: press,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                }],
+            ),
+            &mut origin,
+        );
+        // 光标移到 +40；窗口系统**照着我们的命令真的把窗口搬过去**
+        cur.set(origin0.x + 200.0, origin0.y + 180.0);
+        apply(
+            frame(origin, vec![egui::Event::PointerMoved(press + egui::vec2(40.0, 0.0))]),
+            &mut origin,
+        );
+
+        assert_eq!(origin, origin0 + egui::vec2(40.0, 0.0), "窗口应当跟着光标走 40pt");
+
+        // ---- 光标不动，继续跑 10 帧：位置必须**一动不动** ----
+        // ⚠️ 指针窗口内坐标故意**喂同一个旧值**（真实拖动期间 egui 手里那份就是僵的）
+        for _ in 0..10 {
+            let cmds = frame(origin, vec![egui::Event::PointerMoved(press + egui::vec2(40.0, 0.0))]);
+            seen.push(last_outer(&cmds).unwrap_or(origin));
+            apply(cmds, &mut origin);
+        }
         assert!(
-            cmds.iter().any(|c| matches!(c, egui::ViewportCommand::InnerSize(_))),
-            "贴边按下应当缩放：{cmds:?}"
+            seen.iter().all(|p| (*p - (origin0 + egui::vec2(40.0, 0.0))).length() < 0.01),
+            "光标不动时窗口位置必须钉死，实测这些帧报的落点：{seen:?}"
+        );
+    }
+
+    /// **松手事件丢了，也要停下来**：系统说左键已经不按了 ⇒ 拖动会话当场结束。
+    ///
+    /// 这条守的是 2026-09-29 合成输入实测里**真的看到过**的一幕：`WM_LBUTTONUP` 被
+    /// egui-winit 丢掉（那一步要求 `pointer_pos_in_points` 是 `Some`，而窗口外的指针
+    /// 已经被判成"离开"了），于是 `dragged()` 恒真、会话永不结束 ——
+    /// **界面上的表现是"窗口开始跟着鼠标跑，怎么点都停不下来"**。
+    /// 兜底就是那句 `cursor::left_button_down()`（本仓坑 #9：事件驱动的状态要有证据驱动
+    /// 的兜底）。少了这条，把那个条件删掉不会有任何东西变红。
+    #[test]
+    fn a_lost_button_up_event_still_ends_the_drag() {
+        let cjk = pick_font(&font_candidates()).map(|(_, bytes)| bytes);
+        let ctx = ctx_with_fonts(build_font_definitions(cjk));
+        let (w, h) = (320.0, 380.0);
+        let origin0 = egui::pos2(1000.0, 300.0);
+        let cur = FakeCursor::new();
+        cur.set(origin0.x + 160.0, origin0.y + 180.0);
+        let src = cur.src();
+        // 夹具里的"系统键状态"：能被人为置成"已松开"（真实那颗键只有人手能按）
+        let btn = std::rc::Rc::new(std::cell::Cell::new(true));
+        let b = btn.clone();
+        let button = move || b.get();
+
+        let mut dragging = None;
+        let mut origin = origin0;
+        let mut frame =
+            |origin: egui::Pos2, events: Vec<egui::Event>| -> Vec<egui::ViewportCommand> {
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(w, h),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                raw.viewports.insert(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportInfo {
+                        outer_rect: Some(egui::Rect::from_min_size(origin, egui::vec2(w, h))),
+                        inner_rect: Some(egui::Rect::from_min_size(origin, egui::vec2(w, h))),
+                        ..Default::default()
+                    },
+                );
+                let mut full = ctx.run_ui(raw, |ui| {
+                    egui::CentralPanel::default()
+                        .frame(panel_frame())
+                        .show(ui, |ui| {
+                            handle_window_drag(ui, &mut dragging, &src, &button);
+                            draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
+                        });
+                });
+                full.textures_delta.clear();
+                full.viewport_output
+                    .get(&egui::ViewportId::ROOT)
+                    .map(|o| o.commands.clone())
+                    .unwrap_or_default()
+            };
+
+        let press = egui::pos2(160.0, 180.0);
+        frame(origin, vec![]);
+        frame(origin, vec![egui::Event::PointerMoved(press)]);
+        frame(
+            origin,
+            vec![egui::Event::PointerButton {
+                pos: press,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+        );
+        // 光标走 40pt：窗口跟着走（这一段是"正常拖动"）
+        cur.set(origin0.x + 200.0, origin0.y + 180.0);
+        let cmds = frame(origin, vec![egui::Event::PointerMoved(press + egui::vec2(40.0, 0.0))]);
+        origin = last_outer(&cmds).expect("正常拖动这一段应当报新几何");
+        assert_eq!(origin, origin0 + egui::vec2(40.0, 0.0), "先确认这一段真的在拖");
+
+        // ⚠️ egui 仍然以为按着（指针不动、也没有 Released 事件），但**系统说松了**
+        btn.set(false);
+        cur.set(origin0.x + 240.0, origin0.y + 180.0);
+        let cmds = frame(origin, vec![egui::Event::PointerMoved(press + egui::vec2(80.0, 0.0))]);
+        let after = last_outer(&cmds);
+        assert!(
+            after.is_none() || (after.unwrap() - origin).length() < 0.01,
+            "系统说左键已松 ⇒ 窗口必须停下，实测又挪到 {after:?}"
         );
     }
 

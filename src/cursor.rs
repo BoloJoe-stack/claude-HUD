@@ -2,7 +2,7 @@
 //!
 //! ## 为什么需要一个独立模块
 //!
-//! 挂件的缩放是"自己算"的（见 `ui::apply_resize`）：每帧读光标位置，推出新的窗口几何，
+//! 挂件的移动与缩放都是"自己算"的（见 `ui::apply_drag`）：每帧读光标位置，推出新的窗口几何，
 //! 再发 `OuterPosition` + `InnerSize`。**光标位置必须与窗口位置无关** —— 否则会形成
 //! 正反馈：窗口被自己推着跑，每帧越推越远。
 //!
@@ -19,7 +19,7 @@
 //! `unsafe extern`；rustdoc 不为 extern 块生成文档，故用普通注释）。
 //!
 //! ⚠️ **本模块的函数没有单测**（要真有鼠标与屏幕）。它是"取数"那一层；
-//! 用这个数的几何计算（`ui::apply_resize`）是纯函数，那边有测试钉着 ——
+//! 用这个数的几何计算（`ui::apply_drag`）是纯函数，那边有测试钉着 ——
 //! 包括"光标不动 ⇒ 几何不动"这条**正是本次事故的不变量**。
 
 #[repr(C)]
@@ -31,6 +31,24 @@ struct Point {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn GetCursorPos(p: *mut Point) -> i32;
+    fn GetAsyncKeyState(v_key: i32) -> i16;
+}
+
+/// 左键**此刻**是不是还按着（向系统要，不猜）。
+///
+/// 为什么需要它：拖动会话的结束条件是"egui 说松手了"—— 那是个**事件**。事件会丢：
+/// 2026-09-29 的合成输入实测里，`WM_LBUTTONUP` 被 egui-winit 丢掉（那一步要求
+/// `pointer_pos_in_points` 是 `Some`，而指针当时被判为"已离开窗口"），于是
+/// `down` 一直是 `true`、会话永不结束、**窗口会一直跟着光标跑**。
+///
+/// 这不是新坑，是本仓坑 #9 的同一条教训：**事件驱动的状态必须有一条证据驱动的兜底**
+/// （那边是"转录在长 ⇒ 覆盖成工作中"）。这里就是"键还按着吗"问系统一句。
+pub fn left_button_down() -> bool {
+    const VK_LBUTTON: i32 = 0x01;
+    // SAFETY: 无参数、无指针；`GetAsyncKeyState` 返回的是键状态位，
+    // 最高位（0x8000）为 1 表示"此刻按着"。
+    let state = unsafe { GetAsyncKeyState(VK_LBUTTON) };
+    (state as u16 & 0x8000) != 0
 }
 
 /// 光标的屏幕坐标（egui 点；本机 `pixels_per_point = 1.0`，物理像素与点同值）。
