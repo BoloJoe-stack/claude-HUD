@@ -4,6 +4,7 @@ use crate::model::State;
 use crate::paths;
 use crate::poller;
 use crate::procinfo;
+use crate::screen;
 use crate::state;
 use crate::transcript;
 use crate::usage;
@@ -296,7 +297,8 @@ pub fn run() -> eframe::Result<()> {
             prev(info);
         }));
     }
-    let cfg = config::load_from(&paths::real_config_path());
+    // `mut`：启动位置被夹回可见桌面时要**当场写回配置**（见下面"位置记忆"那段）
+    let mut cfg = config::load_from(&paths::real_config_path());
 
     // 中文字体**先探一次**（纯文件 IO，见 `pick_font`）。探测与安装分开，是因为
     // "取不到中文字体"这件事必须在**窗口出现之前**说出来；而安装要等 eframe 建好窗口
@@ -349,9 +351,26 @@ pub fn run() -> eframe::Result<()> {
     // 有字段、无读者，拖完位置一重启就回到系统随手放的地方。
     //
     // 只在坐标**可信**时才用（见 `config::plausible_window_pos`）—— 一个落在屏幕外的
-    // 坐标会让这个无边框窗口再也找不回来。
+    // 坐标会让这个无边框窗口再也找不回来。**"可信"与"可见"是两件事**：前者只挡
+    // NaN / 天文数字（`|x| ≤ 32000`），所以坐标还要再过一遍 `screen` 的夹取 ——
+    // 2026-09-30 用户报的"hud 又用不了了"，就是配置里躺着一个**完全合法**的屏幕外坐标
+    // `[-484, 603]`（当天是单屏 `0..2560` ⇒ 整窗落在左边界外）：进程好好活着、也在轮询，
+    // 只是画在看不见的地方，而且此后每次启动都回到那里。
+    //
+    // 夹完与配置里那份不一致时**当场写回**：否则每次启动都得再夹一遍，而且谁去读那份
+    // 配置都会被它误导（"坐标看着好好的，问题在别处"）。
     if config::plausible_window_pos(cfg.window_pos) {
-        viewport = viewport.with_position(cfg.window_pos);
+        let want = egui::pos2(cfg.window_pos[0], cfg.window_pos[1]);
+        // 启动这一刻的窗口尺寸就是默认那份：尺寸**不持久化**（配置里只有 `window_pos`）
+        let size = egui::vec2(DEFAULT_INNER_W, DEFAULT_INNER_H);
+        let start = screen::clamp_onto_nearest_monitor(want, size);
+        if start != want {
+            cfg.window_pos = [start.x, start.y];
+            // 写失败**不打扰用户**（与 `remember_window_pos` 同）：这一趟已经夹住了，
+            // 代价只是"下次启动再夹一遍"。
+            let _ = config::save_to(&paths::real_config_path(), &cfg);
+        }
+        viewport = viewport.with_position(start);
     }
 
     let opts = eframe::NativeOptions { viewport, ..Default::default() };
@@ -873,15 +892,21 @@ const POS_EPSILON: f32 = 1.0;
 /// 现在该不该把窗口位置写回配置？**纯函数**，所以这条判据可以被单测钉住
 /// （真窗口的拖动只能人工验收，理由与 `resize_direction_at` 同）。
 ///
-/// 三个条件缺一不可：**停稳了**（`stable_for ≥ 1s`）、**真的动了**（超出 `POS_EPSILON`）、
-/// **坐标可信**（不是 NaN / 天文数字）。只判"动了"会让拖拽过程疯狂写盘；
-/// 只判"停稳"会在没动时也写一遍；不判可信会把屏幕外的坐标记下来，下次窗口就找不回来了。
-fn should_save_pos(cur: [f32; 2], saved: [f32; 2], stable_for: f64) -> bool {
+/// 四个条件缺一不可：**停稳了**（`stable_for ≥ 1s`）、**真的动了**（超出 `POS_EPSILON`）、
+/// **坐标可信**（不是 NaN / 天文数字）、**整窗在屏幕里**（`on_screen`）。只判"动了"会让
+/// 拖拽过程疯狂写盘；只判"停稳"会在没动时也写一遍；不判可信会把屏幕外的坐标记下来，
+/// 下次窗口就找不回来了。
+///
+/// ⚠️ `on_screen` 由调用方**向系统问**（`screen::clamp_*`），不在这里判：这条判据要
+/// 保持纯函数（无平台依赖），而屏幕在哪只有系统知道。它挡的是"坐标可信"挡不住的那种 ——
+/// `[-484, 603]` 在 `plausible_window_pos` 眼里完全合法，却正是 2026-09-30 把窗口弄丢
+/// 的那个坐标（单屏 `0..2560` ⇒ 整窗落在左边界外，此后每次启动都回到那里）。
+fn should_save_pos(cur: [f32; 2], saved: [f32; 2], stable_for: f64, on_screen: bool) -> bool {
     if stable_for < SAVE_POS_AFTER_SECS {
         return false; // 还在拖（或刚停下）
     }
     let moved = (cur[0] - saved[0]).abs() > POS_EPSILON || (cur[1] - saved[1]).abs() > POS_EPSILON;
-    moved && config::plausible_window_pos(cur)
+    moved && config::plausible_window_pos(cur) && on_screen
 }
 
 /// **窗口矩形**（egui 坐标系，原点在窗口左上角）。
@@ -963,6 +988,7 @@ fn handle_window_drag(
     ui: &mut egui::Ui,
     drag: &mut Option<DragSession>,
     cursor_screen: &dyn Fn() -> Option<egui::Vec2>,
+    monitor_at: &dyn Fn(egui::Pos2) -> Option<egui::Rect>,
     left_button_down: &dyn Fn() -> bool,
 ) {
     // ⚠️⚠️ **必须关掉标签的"可选中"** —— 用户 2026-09-17 报"不能拖动"，根因就在这一行。
@@ -1062,7 +1088,7 @@ fn handle_window_drag(
         if response.dragged() && left_button_down() {
             // 拿不到光标就**这一帧什么都不做**（少发一帧命令无害；拿错数会把窗口推着跑）。
             if let Some(c) = cursor_screen() {
-                apply_drag(ui.ctx(), session, c);
+                apply_drag(ui.ctx(), session, c, monitor_at);
             }
         } else if response.drag_stopped() || !response.is_pointer_button_down_on() || !left_button_down()
         {
@@ -1137,7 +1163,12 @@ struct DragSession {
 /// ⚠️ **移动**（`DragKind::Move`）同样吃这条纪律：位移也一律从"按下时的几何 + 光标位移"
 /// 算出来，**绝不从当前窗口几何往回推** —— 否则同一个回路立刻出现（窗口每动一下，
 /// "它自己的位移"就被当成"鼠标又动了"）。这正是把移动与缩放收进同一个函数的原因。
-fn apply_drag(ctx: &egui::Context, session: &mut DragSession, cursor_now: egui::Vec2) {
+fn apply_drag(
+    ctx: &egui::Context,
+    session: &mut DragSession,
+    cursor_now: egui::Vec2,
+    monitor_at: &dyn Fn(egui::Pos2) -> Option<egui::Rect>,
+) {
     use egui::viewport::ResizeDirection as Dir;
     let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
     // 与 `handle_window_drag` 里取起点用的是同一套回退，两边必须一致
@@ -1149,7 +1180,15 @@ fn apply_drag(ctx: &egui::Context, session: &mut DragSession, cursor_now: egui::
     if session.kind == DragKind::Move {
         // 只发 `OuterPosition`。**不发 `InnerSize`** —— 尺寸没变，多发一条只会让窗口
         // 在两帧之间被按一个多余的尺寸重设一次（会闪）。
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(session.outer.min + d));
+        //
+        // ⚠️ 发出去之前先夹进可见桌面（`screen` 模块）：无边框窗口拖出屏幕就**再也
+        // 拖不回来**，而且位置会在停稳后被记进配置、之后每次启动都回到屏幕外 ——
+        // 2026-09-30 用户报的"hud 又用不了了"就是这么来的（`window_pos` 被记成
+        // `[-484, 603]`，单屏 0..2560 ⇒ 整窗在左边界外）。光标本身在屏幕内，所以正常
+        // 拖动时这一夹是 **no-op**；它管的是那种"一旦发生就回不来"的越界。
+        let want = session.outer.min + d;
+        let pos = screen::clamp_with(want, session.outer.size(), monitor_at);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
         return;
     }
 
@@ -1193,6 +1232,10 @@ fn apply_drag(ctx: &egui::Context, session: &mut DragSession, cursor_now: egui::
         }
     }
 
+    // 缩放同样过一遍夹取：会移动原点的边（左/上，以及含它们的角）本来就有把窗口
+    // 推出屏幕的能力，而"推出去"的代价与移动那条路完全一样。正常拖动时它是 no-op
+    // （被拖的那条边跟着光标走，而光标到不了屏幕外）。
+    let min = screen::clamp_with(min, size, monitor_at);
     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(min));
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size - gap));
 }
@@ -2062,10 +2105,11 @@ impl App {
     /// 只在有系统装饰时才有差别，但用 outer 与 `ViewportBuilder::with_position` 的语义一致
     /// （那个收的也是外框位置）。
     fn remember_window_pos(&mut self, ctx: &egui::Context) {
-        let (cur, now) = ctx.input(|i| (i.viewport().outer_rect.map(|r| r.min), i.time));
-        let Some(cur) = cur else {
+        let (outer, now) = ctx.input(|i| (i.viewport().outer_rect, i.time));
+        let Some(outer) = outer else {
             return; // 平台拿不到位置（或窗口还没建好）：这一帧不记
         };
+        let cur = outer.min;
         if self.last_pos != Some(cur) {
             self.last_pos = Some(cur);
             self.pos_stable_since = Some(now);
@@ -2073,7 +2117,12 @@ impl App {
         }
         let stable_for = now - self.pos_stable_since.unwrap_or(now);
         let cur_arr = [cur.x, cur.y];
-        if !should_save_pos(cur_arr, self.saved_pos, stable_for) {
+        // "整窗在屏幕里"只有系统说了算：夹一下还是原值 ⇒ 它本来就可见。
+        // 拖动那条路已经被夹住了（`apply_drag`），这里挡的是**运行中显示器变了**
+        // （拔屏、改分辨率）之后 egui 报回来的那个"新位置"—— 把它记下来，
+        // 等于把下次启动也一起赔进去。
+        let on_screen = screen::clamp_onto_nearest_monitor(cur, outer.size()) == cur;
+        if !should_save_pos(cur_arr, self.saved_pos, stable_for, on_screen) {
             return;
         }
         self.cfg.window_pos = cur_arr;
@@ -2123,7 +2172,13 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(panel_frame())
             .show(ui, |ui| {
-                handle_window_drag(ui, &mut self.dragging, &cursor::screen_pos, &cursor::left_button_down);
+                handle_window_drag(
+                    ui,
+                    &mut self.dragging,
+                    &cursor::screen_pos,
+                    &screen::monitor_rect_at,
+                    &cursor::left_button_down,
+                );
                 draw_panel(ui, &snap.rows, &snap.ledger, snap.first_scan_done, &self.cfg);
             });
     }
@@ -2722,12 +2777,37 @@ mod tests {
         commands_after_drag_at(pos, egui::vec2(14.0, 0.0), w, h)
     }
 
+    /// 测试用的**可见桌面**：足够大，让既有用例里那些坐标一个都不出界。
+    ///
+    /// 夹取本身的功能断言在 `screen.rs`（出界、负数屏、比窗口还小的屏……都在那边）
+    /// 与 `dragging_cannot_push_the_window_off_the_screen`；其余用例给一块大屏，
+    /// 是为了让它们继续测**自己那件事** —— 夹具顺手替它们做决定，就又成了"测另一个世界"。
+    fn desktop() -> impl Fn(egui::Pos2) -> Option<egui::Rect> {
+        |_| {
+            Some(egui::Rect::from_min_max(
+                egui::pos2(-10_000.0, -10_000.0),
+                egui::pos2(10_000.0, 10_000.0),
+            ))
+        }
+    }
+
     /// 同上，但可以指定"拖多远"。
     fn commands_after_drag_at(
         pos: egui::Pos2,
         drag: egui::Vec2,
         w: f32,
         h: f32,
+    ) -> Vec<egui::ViewportCommand> {
+        commands_after_drag_on(pos, drag, w, h, &desktop())
+    }
+
+    /// 同上，但**桌面由调用方给** —— "拖出屏幕"那两条断言靠它把窗口逼到边上。
+    fn commands_after_drag_on(
+        pos: egui::Pos2,
+        drag: egui::Vec2,
+        w: f32,
+        h: f32,
+        monitor_at: &dyn Fn(egui::Pos2) -> Option<egui::Rect>,
     ) -> Vec<egui::ViewportCommand> {
         let cjk = pick_font(&font_candidates()).map(|(_, bytes)| bytes);
         let ctx = ctx_with_fonts(build_font_definitions(cjk));
@@ -2748,7 +2828,7 @@ mod tests {
             };
             let mut full = ctx.run_ui(raw, |ui| {
                 egui::CentralPanel::default().frame(panel_frame()).show(ui, |ui| {
-                    handle_window_drag(ui, &mut resizing, &src, &|| true); // ← 与 `App::ui` 同一个调用点、同一层
+                    handle_window_drag(ui, &mut resizing, &src, monitor_at, &|| true); // ← 与 `App::ui` 同一个调用点、同一层
                     draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
                 });
             });
@@ -2855,7 +2935,7 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(panel_frame())
                         .show(ui, |ui| {
-                            handle_window_drag(ui, &mut resizing, &src, &|| true);
+                            handle_window_drag(ui, &mut resizing, &src, &desktop(), &|| true);
                             draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
                         });
                 });
@@ -3211,6 +3291,61 @@ mod tests {
         }
     }
 
+    /// **拖动不能把窗口拖出屏幕**（2026-09-30 的事故，用户报的是"hud 又用不了了"）。
+    ///
+    /// 无边框窗口拖出屏幕 = **消失**：光标到不了屏幕外，可窗口的**原点**能 ——
+    /// 原点按下时的位置 + 光标位移，而位移不必受原点约束。真机实测是 `x = -484`
+    /// （单屏 `0..2560`，整窗落在左边界外），位置随即被记进配置，之后每次启动都回到那里。
+    ///
+    /// ⚠️ 夹具里窗口原点就是 `(0,0)`（无头环境没有 `outer_rect`，回落到窗口矩形），
+    /// 所以"往左拖"这一格测的正是**原点已经贴着左缘时还能不能继续往左**。
+    #[test]
+    fn dragging_cannot_push_the_window_off_the_screen() {
+        // 1920×1080 的桌面；窗口 320×380
+        let desk = |_p: egui::Pos2| {
+            Some(egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1920.0, 1080.0),
+            ))
+        };
+        for (name, drag, want) in [
+            ("往左拖 800：只能贴左缘", egui::vec2(-800.0, 0.0), (0.0, 0.0)),
+            ("往右拖 2000：贴右缘（1920−320）", egui::vec2(2000.0, 0.0), (1600.0, 0.0)),
+            ("往上拖 500：只能贴上缘", egui::vec2(0.0, -500.0), (0.0, 0.0)),
+            ("往下拖 1000：贴下缘（1080−380）", egui::vec2(0.0, 1000.0), (0.0, 700.0)),
+        ] {
+            let cmds = commands_after_drag_on(egui::pos2(160.0, 180.0), drag, 320.0, 380.0, &desk);
+            let outer = last_outer(&cmds).unwrap_or_else(|| panic!("{name}：应当发出 OuterPosition"));
+            assert!(
+                (outer.x - want.0).abs() < 0.5 && (outer.y - want.1).abs() < 0.5,
+                "{name}：期望原点 {want:?}，实测 ({}, {}) —— 窗口跑到屏幕外就再也拖不回来了",
+                outer.x,
+                outer.y
+            );
+            assert!(!sent_inner_size(&cmds), "{name}：移动不该发 InnerSize");
+        }
+    }
+
+    /// 缩放那条路同样夹（会移动原点的边：左/上，以及含它们的角）。
+    #[test]
+    fn resizing_cannot_push_the_window_off_the_screen_either() {
+        let desk = |_p: egui::Pos2| {
+            Some(egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1920.0, 1080.0),
+            ))
+        };
+        // 左缘往左狂拖 800pt：右缘钉在 x=320、宽涨到 1120（放得下），
+        // 而**原点不许变成负的** —— 那正是"整窗出界"的起点。
+        let cmds = commands_after_drag_on(egui::pos2(1.0, 180.0), egui::vec2(-800.0, 0.0), 320.0, 380.0, &desk);
+        let outer = last_outer(&cmds).expect("应当发出 OuterPosition");
+        assert!(
+            outer.x >= -0.5,
+            "左缘缩放把原点推到 {}（屏幕左界是 0）—— 窗口会整块出界",
+            outer.x
+        );
+    }
+
     /// **缩放到最小尺寸就停住**，而且**被拖的那条边顶回去**（不能一边缩一边飘）。
     ///
     /// 用户 2026-09-17："设置最小的大小限制"。
@@ -3280,7 +3415,7 @@ mod tests {
             let mut resizing = None;
             let mut full = ctx.run_ui(raw, |ui| {
                 egui::CentralPanel::default().frame(panel_frame()).show(ui, |ui| {
-                    handle_window_drag(ui, &mut resizing, &|| Some(egui::Vec2::ZERO), &|| true);
+                    handle_window_drag(ui, &mut resizing, &|| Some(egui::Vec2::ZERO), &desktop(), &|| true);
                     draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
                 });
             });
@@ -4600,7 +4735,7 @@ mod tests {
                 ..Default::default()
             };
             let mut full = ctx.run_ui(raw, |ui| {
-                handle_window_drag(ui, &mut dragging, &src, &|| true);
+                handle_window_drag(ui, &mut dragging, &src, &desktop(), &|| true);
                 ui.label("中文会话名"); // 内容在拖拽区之后注册
             });
             full.textures_delta.clear(); // 不 clear 会 panic（见报告附录）
@@ -4737,7 +4872,7 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(panel_frame())
                         .show(ui, |ui| {
-                            handle_window_drag(ui, &mut dragging, &src, &|| true);
+                            handle_window_drag(ui, &mut dragging, &src, &desktop(), &|| true);
                             draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
                         });
                 });
@@ -4837,7 +4972,7 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(panel_frame())
                         .show(ui, |ui| {
-                            handle_window_drag(ui, &mut dragging, &src, &button);
+                            handle_window_drag(ui, &mut dragging, &src, &desktop(), &button);
                             draw_panel(ui, &[], &usage::LedgerView::default(), true, &config::Config::default());
                         });
                 });
@@ -5355,18 +5490,25 @@ mod tests {
     fn the_window_position_is_saved_only_when_it_settles_and_really_moved() {
         let saved = [100.0_f32, 100.0];
         // 还在拖（没停稳）—— 哪怕位置已经变了也不写：一次拖拽会写几十次
-        assert!(!should_save_pos([300.0, 400.0], saved, 0.0));
-        assert!(!should_save_pos([300.0, 400.0], saved, 0.99));
+        assert!(!should_save_pos([300.0, 400.0], saved, 0.0, true));
+        assert!(!should_save_pos([300.0, 400.0], saved, 0.99, true));
         // 停稳了但没动 —— 不写（否则每次启动都会把配置重写一遍）
-        assert!(!should_save_pos(saved, saved, 5.0));
-        assert!(!should_save_pos([100.5, 100.0], saved, 5.0), "半像素抖动不算动");
-        assert!(!should_save_pos([101.0, 100.0], saved, 5.0), "正好一个 epsilon 不算动（判据是严格大于）");
+        assert!(!should_save_pos(saved, saved, 5.0, true));
+        assert!(!should_save_pos([100.5, 100.0], saved, 5.0, true), "半像素抖动不算动");
+        assert!(!should_save_pos([101.0, 100.0], saved, 5.0, true), "正好一个 epsilon 不算动（判据是严格大于）");
         // 停稳 + 真的动了 —— 写
-        assert!(should_save_pos([101.5, 100.0], saved, 1.0));
-        assert!(should_save_pos([100.0, 260.0], saved, 1.0), "只动一个轴也算");
-        // 坐标不可信时不写 —— 一个落在屏幕外的坐标会让无边框窗口再也找不回来
-        assert!(!should_save_pos([f32::NAN, 100.0], saved, 5.0));
-        assert!(!should_save_pos([1.0e9, 100.0], saved, 5.0));
+        assert!(should_save_pos([101.5, 100.0], saved, 1.0, true));
+        assert!(should_save_pos([100.0, 260.0], saved, 1.0, true), "只动一个轴也算");
+        // 坐标不可信时不写（NaN / 天文数字）
+        assert!(!should_save_pos([f32::NAN, 100.0], saved, 5.0, true));
+        assert!(!should_save_pos([1.0e9, 100.0], saved, 5.0, true));
+        // **整窗在屏幕外时不写** —— 这条与"可信"是两回事：`[-484, 603]` 在
+        // `plausible_window_pos` 眼里完全合法，却正是 2026-09-30 把窗口弄丢的那个坐标。
+        // 记住一个屏幕外的位置，等于把下次启动也一起赔进去。
+        assert!(
+            !should_save_pos([101.5, 100.0], saved, 5.0, false),
+            "停稳了、也真的动了，但窗口整块在屏幕外 ⇒ 不许写"
+        );
     }
 
     /// 把一帧里的**线段**分成竖与横两组（分隔线也是 `LineSegment`，必须能区分）。
