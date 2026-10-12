@@ -175,7 +175,7 @@ pub fn build_rows_with_deltas(
             //    **没有 `UserPromptSubmit`** ⇒ 上一个 `Stop` 的「完成」会一直挂到回合结束。
             //
             // 转录是唯一能看见"此刻真的在动"的信号：状态文件只在事件边界更新，**转录是流**。
-            // 判据用 `last_line_at > state_since`（状态定下来的时刻之后还有新行）。
+            // 判据用 `last_line_at > last_event_at`（**最后一次收到事件**之后还有新行）。
             //
             // ⚠️ 四处小心：
             // - **只覆盖 `Waiting` / `Done` / `Idle`**。`Error`（API 挂了）与 `Interrupted`
@@ -188,17 +188,31 @@ pub fn build_rows_with_deltas(
             //   （这类回合**不发任何已注册事件**）⇒ 界面上一个正在烧 token 的会话写着"待命"、
             //   计时还在走，排序还把它扔进"完成/待命"组排到前面。
             //   **判据本身（转录有没有动）才是真正的鉴别器**，所以放进 `Idle` 不会误伤：
-            //   真空闲的会话 `last_line_at` 就停在 `state_since` 那一带（`Stop` 是读完转录
+            //   真空闲的会话 `last_line_at` 就停在 `last_event_at` 那一带（`Stop` 是读完转录
             //   才发的），过不了下面那道严格大于 + 2s 余量的关 —— 这条由用例里的**反向对照**
             //   ⑦'（转录没再动 ⇒ 老实待命）守着。
+            // - ⭐⭐ **锚点必须是 `last_event_at`，不是 `state_since`**（2026-10-12 修，用户当天报
+            //   "暂停下来等我决策，HUD 还是显示工作中"）：
+            //   `state_since` 只在**状态真的变化**时刷新（`hook.rs` 的 `if state_changed`），
+            //   而 `Notification(permission_prompt)` 落在一个**已经是 `Waiting`** 的会话上时
+            //   `state_changed == false` ⇒ **`state_since` 原地不动**，从此 `last_line_at >
+            //   state_since + 2` 恒真 —— 这个会话**再也画不出"等待确认"**，哪怕它正卡在框上。
+            //   真机现场（会话 `4473e021`，2026-10-12）：`state_since` 停在 10:45:33（那次等待），
+            //   会话随后干了 20 分钟活（转录一直推进），11:08:16 又弹一个 `AskUserQuestion`
+            //   （业务问句此处不抄），通知 11:08:22 按时到达（= 弹框 + 6s 防抖）——
+            //   但界面从 11:08 一直写到 **11:28**（用户 11:20:46 就是看着这个来报的）。
+            //   `last_event_at` 是**每个事件都刷新**的（`hook.rs` 里无条件 `= now`），
+            //   且恒有 `last_event_at >= state_since`（两者同一个时钟、`state_since` 是更早那次
+            //   事件的 `now`），所以换锚点**只会收紧、不会松口**。
             // - **留 2 秒余量**：`Stop` 事件是读完 transcript 才发的（payload 里带着
-            //   `last_assistant_message`），所以正常情况下最后一行**早于** `state_since`；
+            //   `last_assistant_message`），所以正常情况下最后一行**早于** `last_event_at`；
             //   但毫秒级抖动与时钟粒度可能让它们几乎相等，没余量会每回合末闪一下"工作中"。
             // - **真的在等授权时不会误判**：那时主代理是**阻塞**的，转录不写新行，
-            //   `last_line_at` 停在发起工具调用那一刻（早于 `state_since`）。
+            //   `last_line_at` 停在发起工具调用那一刻（早于通知到达的 `last_event_at`；
+            //   通知本身还自带 6s 防抖，余量更足）。
             let transcript_moved_on = delta
                 .and_then(|d| d.last_line_at)
-                .is_some_and(|t| t > s.state_since + ACTIVITY_SLACK_SECS);
+                .is_some_and(|t| t > s.last_event_at + ACTIVITY_SLACK_SECS);
             let state = if transcript_moved_on
                 && matches!(state, State::Waiting | State::Done | State::Idle)
             {
@@ -564,10 +578,23 @@ mod wire_tests {
         let moved = |t: i64| Delta { last_line_at: Some(t), ..Default::default() };
         let idle_transcript = Delta { last_line_at: Some(50), ..Default::default() };
 
+        // 夹具：`state_since` 与 `last_event_at` **一起给**。
+        //
+        // 真机上两者恒有 `last_event_at >= state_since`（同一个时钟；`state_since` 抄的是
+        // 更早那次事件的 `now`，见 `hook.rs`）。旧夹具只写 `state_since`、把 `last_event_at`
+        // 留在 0 —— 那是**现实里不存在的组合**。2026-10-12 把判据锚点从前者换成后者时，
+        // ③④⑥⑦' 四条集体变红（`last_line_at=50 > 0+2`）；红得好：说明这些夹具从来没测到
+        // "锚点是哪一个"，**夹具与真实对象不一致就是测另一个世界**（本项目的账）。
+        let at = |state: &str, t: i64| {
+            let mut s = st("a");
+            s.state = state.into();
+            s.state_since = t;
+            s.last_event_at = t;
+            s
+        };
+
         // ① 等待确认 + 转录在那之后动过（用户刚点了"允许"）⇒ 工作中
-        let mut waiting = st("a");
-        waiting.state = "waiting".into();
-        waiting.state_since = 100;
+        let waiting = at("waiting", 100);
         let rows = build_rows_with_deltas(
             &[waiting],
             &HashMap::from([("a".to_string(), moved(200))]),
@@ -577,9 +604,7 @@ mod wire_tests {
         assert_eq!(rows[0].state, State::Working, "批了权限之后就该是工作中");
 
         // ② 完成 + 转录在那之后动过（后台子代理干完把主代理唤醒了）⇒ 工作中
-        let mut done = st("a");
-        done.state = "done".into();
-        done.state_since = 100;
+        let done = at("done", 100);
         let rows = build_rows_with_deltas(
             &[done],
             &HashMap::from([("a".to_string(), moved(200))]),
@@ -590,9 +615,7 @@ mod wire_tests {
 
         // ③ **反向对照**：真的在等授权时主代理是阻塞的、转录不写新行 ⇒ 必须保持"等待确认"。
         //    写成无条件覆盖的话，这条会红 —— 那会把"真的在等你"藏成"工作中"。
-        let mut waiting = st("a");
-        waiting.state = "waiting".into();
-        waiting.state_since = 100;
+        let waiting = at("waiting", 100);
         let rows = build_rows_with_deltas(
             &[waiting],
             &HashMap::from([("a".to_string(), idle_transcript.clone())]),
@@ -603,9 +626,7 @@ mod wire_tests {
 
         // ④ **反向对照**：回合正常结束（最后一行早于 Stop）⇒ 必须保持"完成"。
         //    没有这条，每个回合结束时都会闪成"工作中"。
-        let mut done = st("a");
-        done.state = "done".into();
-        done.state_since = 100;
+        let done = at("done", 100);
         let rows = build_rows_with_deltas(
             &[done],
             &HashMap::from([("a".to_string(), idle_transcript)]),
@@ -615,9 +636,7 @@ mod wire_tests {
         assert_eq!(rows[0].state, State::Done, "正常的完成态不许被顶掉");
 
         // ⑤ `Error` 不在覆盖范围内：API 挂了是要你动手的档，藏掉就看不见了。
-        let mut failed = st("a");
-        failed.state = "error".into();
-        failed.state_since = 100;
+        let failed = at("error", 100);
         let rows = build_rows_with_deltas(
             &[failed],
             &HashMap::from([("a".to_string(), moved(200))]),
@@ -628,9 +647,7 @@ mod wire_tests {
 
         // ⑥ 边界：正好等于 `state_since + 余量` **不算**动过（判据是严格大于）。
         //    这条钉的是"余量"的存在 —— 去掉 `+ ACTIVITY_SLACK_SECS` 它就会红。
-        let mut done = st("a");
-        done.state = "done".into();
-        done.state_since = 100;
+        let done = at("done", 100);
         let rows = build_rows_with_deltas(
             &[done],
             &HashMap::from([("a".to_string(), moved(102))]),
@@ -649,9 +666,7 @@ mod wire_tests {
         //    ⇒ **打不上**，界面上是一个正在烧 token 的会话写着"待命"，计时还在走，
         //    排序还把它扔进"完成/待命"组排到前面（用户 09-17 拍板"工作中的放下边"）。
         //    用户 09-16 报的那句"明明是在工作中，却显示工作完成"在这里**原样复发**。
-        let mut done = st("a");
-        done.state = "done".into();
-        done.state_since = 100;
+        let done = at("done", 100);
         let rows = build_rows_with_deltas(
             &[done],
             &HashMap::from([("a".to_string(), moved(400))]),
@@ -667,9 +682,7 @@ mod wire_tests {
         // ⑦' **反向对照**：同一个"早就 Stop 过"的会话，转录**没有**再动 ⇒ 必须老实待命。
         //     没有这一条，"把所有 Idle 一律顶成工作中"这种实现也能过 ——
         //     而那样每个空闲会话都会永远显示"工作中"。
-        let mut done = st("a");
-        done.state = "done".into();
-        done.state_since = 100;
+        let done = at("done", 100);
         let rows = build_rows_with_deltas(
             &[done],
             &HashMap::from([("a".to_string(), Delta { last_line_at: Some(98), ..Default::default() })]),
@@ -677,6 +690,65 @@ mod wire_tests {
             500,
         );
         assert_eq!(rows[0].state, State::Idle, "转录没再动，就该按 decay 老实显示待命");
+    }
+
+    /// ⭐ **同一会话的第二个确认框，界面再也画不出"等待确认"** —— 2026-10-12 真机事故。
+    ///
+    /// `state_since` 只在状态**真的变化**时刷新（`hook.rs` 的 `if state_changed`）；而
+    /// `Notification(permission_prompt)` 落在一个**已经是 `Waiting`** 的会话上时不算变化
+    /// ⇒ `state_since` 停在**上一次**等待那一刻，中间那段干活又把转录推得更远
+    /// ⇒ `last_line_at > state_since + 2` 恒真 ⇒ 这个会话**从此永远画成"工作中"**，
+    /// 哪怕它正卡在框上等你。
+    ///
+    /// 下面三个数字**全是真机的**（会话 `4473e021`，2026-10-12 上午，epoch 秒）：
+    /// `state_since` = 10:45:33（那次等待定格的时刻）→ 接着干了 20 分钟活（转录一直在推进）
+    /// → 11:08:16 弹出 `AskUserQuestion`（业务问句此处不抄，一直挂到 11:28:07）
+    /// → 通知 11:08:22 到达（= 弹框 + 6s 防抖，分秒对得上）。
+    /// 用户 11:20:46 就是看着这个来报的"暂停下来等我决策，HUD 还是显示工作中"。
+    #[test]
+    fn a_second_prompt_is_not_overwritten_by_activity_from_between_the_two() {
+        let cfg = Config::default();
+        const SINCE_1ST: i64 = 1_791_773_133; // 10:45:33 第一次等待定格的时刻
+        const LINE_BEFORE_2ND: i64 = 1_791_774_496; // 11:08:16 弹框那一刻转录的最后一行
+        const NOTIFY_2ND: i64 = 1_791_774_502; // 11:08:22 通知到达（+6s 防抖）
+        const ANSWERED: i64 = 1_791_775_687; // 11:28:07 用户答了，转录才又动
+
+        let mut second = st("4473e021");
+        second.state = "waiting".into();
+        second.state_since = SINCE_1ST; // ← 陈旧：第二次等待**不会**刷新它
+        second.last_event_at = NOTIFY_2ND; // ← 每个事件都刷新
+
+        // ① 真机那一刻：转录停在弹框之前 ⇒ 必须老实显示"等待确认"。
+        //    锚点若用 `state_since`（1_791_773_133），`LINE_BEFORE_2ND` 比它晚 1363s ⇒
+        //    被顶成"工作中" —— 这条用例就是钉这个的。
+        let rows = build_rows_with_deltas(
+            &[second.clone()],
+            &HashMap::from([(
+                "4473e021".to_string(),
+                Delta { last_line_at: Some(LINE_BEFORE_2ND), ..Default::default() },
+            )]),
+            &cfg,
+            NOTIFY_2ND + 120,
+        );
+        assert_eq!(
+            rows[0].state,
+            State::Waiting,
+            "第二个确认框弹出来之后，转录没再动 ⇒ 就是等待确认（不许被框前的活动顶掉）"
+        );
+
+        // ② **反向对照**：用户答了 ⇒ 转录在**通知之后**又来一行 ⇒ 必须顶成"工作中"。
+        //    没有这条，把锚点一棍子打死（干脆不顶）也能过，而那会复发 09-16 报的
+        //    "明明在工作，却显示等待确认"。
+        let rows = build_rows_with_deltas(
+            &[second],
+            &HashMap::from([(
+                "4473e021".to_string(),
+                Delta { last_line_at: Some(ANSWERED), ..Default::default() },
+            )]),
+            &cfg,
+            ANSWERED + 120,
+        );
+        assert_eq!(rows[0].state, State::Working, "答完就该是工作中");
     }
 
     #[test]
