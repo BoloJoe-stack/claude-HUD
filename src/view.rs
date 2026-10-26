@@ -47,8 +47,10 @@ pub struct Row {
     pub subtitle: Option<String>,
     /// **在跑的子代理个数**（第二轮新增，用户要求"显示子代理任务情况"）。
     ///
-    /// 口径 = 主 transcript 里尚未收到 `tool_result` 的 `Agent` 工具调用数
-    /// （推导过程与"为什么不用另外三条信号"见 `transcript::Delta::pending_agents`）。
+    /// 口径 = 主 transcript 里尚未收到 `tool_result` 的 `Agent` 工具调用数，**加上**
+    /// 已启动 / 被 `SendMessage` 续跑、还没等到 `<task-notification>` 的后台代理
+    /// （推导过程与"为什么不用另外三条信号"见 `transcript::Delta::pending_agents`
+    /// 与 `Delta::bg_agents`）。
     /// **没有子代理时恒为 0**，界面据此**不画**这一段（而不是画一个 0）。
     pub subagent_count: u32,
     /// **宿主 Claude Code 进程已经不在了**（9b 的僵尸会话）。
@@ -516,6 +518,26 @@ mod wire_tests {
             100,
         );
         assert_eq!(rows[0].state, State::Working, "有子代理在跑时不能显示完成");
+
+        // **后台/续跑**的子代理走的是另一个集合（`bg_agents`），覆盖必须一视同仁：
+        // 2026-10-26 用户报的"明明有子代理，但是还是显示完成"就是 `SendMessage` 续跑
+        // 没有进集合 —— 状态文件里写着 `done`，而子代理正在干活。
+        let resumed = Delta {
+            bg_agents: ["send_1".to_string()].into(),
+            ..Default::default()
+        };
+        let rows = build_rows_with_deltas(
+            &[stopped.clone()],
+            &HashMap::from([("a".to_string(), resumed)]),
+            &cfg,
+            100,
+        );
+        assert_eq!(
+            rows[0].state,
+            State::Working,
+            "续跑（SendMessage）的后台子代理也必须把完成顶成工作中"
+        );
+        assert_eq!(rows[0].subagent_count, 1, "子代理计数要含后台/续跑的");
 
         // **反向对照**：没有子代理时**必须**保持 Done —— 别把这条覆盖写成无条件的，
         // 那会让所有完成态永远显示"工作中"。

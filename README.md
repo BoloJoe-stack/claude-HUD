@@ -7,6 +7,8 @@ Windows 桌面常驻小挂件：一眼看清**多个并发 Claude Code 会话**�
 
 1. 从 [Releases](https://github.com/BoloJoe-stack/claude-hud/releases) 下载 `claude-hud.exe`，
    放到一个**以后不会移动**的目录
+   - 就一个 exe，**不需要装 Rust、不需要 VC++ 运行库、不需要 .NET / Node**
+     （C 运行库已静态链接进 exe，干净 Windows 双击即跑）
 2. `claude-hud.exe --install-hooks` —— 把 8 个事件写进全局 `~/.claude/settings.json`
    （只新增 `hooks` 键，你原有的 `env` 等配置一字不动；重复执行不会翻倍）
 3. 双击 `claude-hud.exe` 起挂件
@@ -42,6 +44,15 @@ cargo build --release      # → target/release/claude-hud.exe
 ```
 
 仅 Windows；exe 无运行时依赖（不需要 .NET / WebView / Node）。
+
+⚠️ 仓库里的 `.cargo/config.toml` 给 MSVC 目标加了 `+crt-static` —— **别删**。
+没有它，Rust 默认动态链接 `VCRUNTIME140.dll`，在没装 VC++ 运行库的机器上会报
+"计算机中丢失 VCRUNTIME140.dll"。改完构建后用下式自检，输出里**不得**出现
+`VCRUNTIME140.dll`：
+
+```bash
+objdump -p target/release/claude-hud.exe | grep "DLL Name"
+```
 
 ## 许可
 

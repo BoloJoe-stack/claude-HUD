@@ -1,0 +1,14 @@
+# 发布二进制必须是**单文件可运行**的：不给下载者留"先装 VC++ 运行库"这一步。
+#
+# MSVC 目标默认**动态**链接 C 运行库，于是 exe 的导入表里有 `VCRUNTIME140.dll` ——
+# 一台干净的 Windows（没装 Visual C++ Redistributable）双击就会报
+# "计算机中丢失 VCRUNTIME140.dll"，看起来像"还得装 Rust 那一套"。
+# `+crt-static` 把 CRT 静态链进 exe；实测导入表里 `VCRUNTIME140.dll` 消失，
+# 只剩 Windows 自带的系统 DLL（kernel32 / user32 / opengl32 / …）。
+#
+# 代价：exe 体积增大约 0.2 MB（相比依赖运行库的失败启动，这个代价值得）。
+# 验证方法（改完必须重跑）：
+#     objdump -p target/release/claude-hud.exe | grep "DLL Name"
+# 判据：输出里**不得**出现 VCRUNTIME140.dll / MSVCP140.dll。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

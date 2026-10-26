@@ -274,6 +274,103 @@ mod parse_tests {
         assert!(d.bg_agents.is_empty(), "收到终止通知之后必须移除");
     }
 
+    /// **续跑的子代理也必须算「在跑」** —— 2026-10-26 用户报"明明有子代理，但还是显示完成"。
+    ///
+    /// 真机形态（会话 `4e7e1297`，下面 JSON 逐字取自该转录）：
+    /// ① 06:43 用 `Agent` 派一个后台代理；② 06:53 它干完，`<task-notification>` 把
+    /// `bg_agents` 清空；③ 06:56 主代理用 `SendMessage` 给它**追加任务**，它重新跑起来；
+    /// ④ 06:57 主代理 `Stop` —— 从这一刻到 07:05 它真正干完，界面一直写"完成"。
+    ///
+    /// 关键：**没有新的 `Agent` 调用**，而续跑的完成通知带的 `<tool-use-id>` 是**这条
+    /// `SendMessage`** 的 id。
+    #[test]
+    fn a_resumed_subagent_keeps_running_until_the_sendmessage_notification() {
+        let resume = concat!(
+            // ③ 主代理把任务追加给已有代理（真机：`call_00_ET_IeZWCr2djf2iwQxDVm2l9242`）
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call_send","name":"SendMessage","input":{"to":"aa0d0ab2b4467a410","type":"message","summary":"复核第二轮"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"call_send","type":"tool_result","content":[{"type":"text","text":"{\"success\":true,\"message\":\"Resuming agent aa0d0ab\",\"resumedAgentId\":\"aa0d0ab2b4467a410\",\"pin\":{\"id\":\"aa0d0ab2b4467a410\",\"name\":\"aa0d0ab2b4467a410\",\"ref\":\"9b4d0d\"}}"}]}]}}"#,
+            "\n",
+        );
+        for line in resume.lines() {
+            serde_json::from_str::<Value>(line).expect("夹具必须是合法 JSON");
+        }
+        let d = parse_delta(resume, &Delta::default());
+        assert!(
+            d.pending_agents.is_empty(),
+            "续跑不是「前台在飞」：它没有新的 Agent 调用"
+        );
+        assert_eq!(
+            d.bg_agents.len(),
+            1,
+            "续跑成功 = 子代理又在干，必须算「在跑」：{:?}",
+            d.bg_agents
+        );
+        assert!(
+            d.send_message_ids.is_empty(),
+            "白名单里的 id 见到结果后就该消费掉"
+        );
+
+        // ④ 它真干完了：终止通知带的是**这条 SendMessage** 的 id。
+        let finished = concat!(
+            r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-26T07:05:03.605Z","sessionId":"s","content":"<task-notification>\n<task-id>aa0d0ab2b4467a410</task-id>\n<tool-use-id>call_send</tool-use-id>\n<output-file>C:\\x</output-file>\n<status>completed</status>\n<summary>Agent \"复核\" finished</summary>\n</task-notification>"}"#,
+            "\n",
+        );
+        let d = parse_delta(finished, &d);
+        assert!(
+            d.bg_agents.is_empty(),
+            "终止通知一到就必须收工：{:?}",
+            d.bg_agents
+        );
+    }
+
+    /// **反向对照**：`SendMessage` 的两类"不是续跑"的结果都不许被当成在跑的子代理。
+    ///
+    /// - `"Message queued for delivery …"`：代理本来就在跑（通知仍记在**当前那一轮**的 id 上）；
+    /// - 发给**别的 Claude 会话**：结果里写 `another Claude session`，与本会话的子代理无关。
+    #[test]
+    fn a_non_resume_sendmessage_does_not_create_a_running_subagent() {
+        let queued = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call_q","name":"SendMessage","input":{"to":"af39105cd6aefe86e","type":"message"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"call_q","type":"tool_result","content":[{"type":"text","text":"{\"success\":true,\"message\":\"Message queued for delivery to af39105cd6aefe86e at its next tool round.\",\"pin\":{\"id\":\"af39105cd6aefe86e\"}}"}]}]}}"#,
+            "\n",
+        );
+        let d = parse_delta(queued, &Delta::default());
+        assert!(d.bg_agents.is_empty(), "排队消息不是在跑的子代理：{:?}", d.bg_agents);
+
+        let cross = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call_x","name":"SendMessage","input":{"to":"claude-b3","type":"message"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"call_x","type":"tool_result","content":[{"type":"text","text":"{\"success\":true,\"message\":\"… queued there\"} —— claude-b3 (another Claude session on this machine)"}]}]}}"#,
+            "\n",
+        );
+        let d = parse_delta(cross, &Delta::default());
+        assert!(d.bg_agents.is_empty(), "别的会话与本会话的子代理无关：{:?}", d.bg_agents);
+    }
+
+    /// **反向对照**：一句普通的工具输出里**引用**了 `resumedAgentId`（读源码 / grep / 打印
+    /// 转录片段都会这样），**不许**凭空造出一个在跑的子代理。
+    ///
+    /// 与 `a_bash_output_quoting_the_launch_ack_does_not_create_a_phantom_agent` 同源：
+    /// 内容匹配必须配一个"这个 id 真是 SendMessage"的白名单，否则幽灵代理收不到任何
+    /// 终止通知，界面会永远挂着"工作中"。
+    #[test]
+    fn a_bash_output_quoting_resume_metadata_does_not_create_a_phantom_agent() {
+        let t = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"call_bash1","name":"Bash","input":{"command":"grep -n resumedAgentId src/transcript.rs"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"call_bash1","type":"tool_result","content":[{"type":"text","text":"line 123: \"resumedAgentId\":\"aa0d0ab2b4467a410\" —— Resuming agent aa0d0ab"}]}]}}"#,
+            "\n",
+        );
+        let d = parse_delta(t, &Delta::default());
+        assert!(
+            d.bg_agents.is_empty(),
+            "引用不算续跑：{:?}（无白名单时这就是幽灵代理的来源）",
+            d.bg_agents
+        );
+    }
+
     /// **反向对照**：一句普通的工具输出里**引用**了那句启动回执（`grep` 源码、打印转录片段
     /// 都会这样），**不许**因此凭空造出一个后台代理。
     ///
@@ -692,6 +789,20 @@ use std::collections::BTreeSet;
 /// 子代理是通过 `Agent` 工具调用派发的，所以"哪个工具代表一个子代理"就是这一个名字。
 const AGENT_TOOL: &str = "Agent";
 
+/// 已经派出去的子代理可以**再次被唤醒**：主代理用 `SendMessage` 给它追加任务，它就重新
+/// 跑起来（2026-10-26 真机取证）。这一次**没有新的 `Agent` 调用**，所以只看 `Agent`
+/// 的配对会把"正在跑"漏判成"完成" —— 用户报的"明明有子代理，但是还是显示完成"。
+///
+/// 实测（本机 30 天 12 次 `SendMessage`、其中 9 次是续跑）：
+/// - 续跑成功的结果是 `{"success":true,"message":"Resuming agent …","resumedAgentId":"…"}`；
+/// - 它**干完之后**的 `<task-notification>` 带的 `<tool-use-id>` 是**这条 `SendMessage`**
+///   的 id，不是当初那条 `Agent` 的 id ⇒ 把它当后台代理记进 `bg_agents` 后，既有的终止
+///   通知判据能原样把它清掉，不需要第二条清理路径。
+/// - 只认 `resumedAgentId`：另一类结果是 `"Message queued for delivery …"`（代理本来就在
+///   跑，通知仍记在**当前那一轮**的 id 上），而给**别的 Claude 会话**发消息会带
+///   `"another Claude session"`。这两类都**不是**本会话多了一个在跑的子代理。
+const SEND_MESSAGE_TOOL: &str = "SendMessage";
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Delta {
     pub context_tokens: Option<u64>,
@@ -726,7 +837,9 @@ pub struct Delta {
     /// 就必须知道是哪一个。并行派发因此天然成立。
     pub pending_agents: BTreeSet<String>,
 
-    /// **后台**子代理：已收到"已在后台启动"回执、**还没等到终止通知**的 id。
+    /// **后台**子代理：已收到"已在后台启动"回执（或被 `SendMessage` 续跑成功）、
+    /// **还没等到终止通知**的 id —— 两种情况下，通知带的都是**发起这一轮的那个
+    /// tool_use id**（`Agent` 或 `SendMessage`，见 [`SEND_MESSAGE_TOOL`]）。
     ///
     /// ⚠️ 为什么要与 `pending_agents` 分开：**后台代理的 `tool_result` 是启动回执，
     /// 不是完成**（内容是 `Async agent launched successfully… The agent is working in
@@ -749,6 +862,14 @@ pub struct Delta {
     /// 现在按**结构**认（见 `is_notification_carrier`），并配反向对照
     /// `a_notification_inside_my_own_tool_output_does_not_clear_agents`。
     pub bg_agents: BTreeSet<String>,
+
+    /// **尚未见到结果的 `SendMessage` 调用**（`tool_use` id）。
+    ///
+    /// 只为一件事存在：把"续跑成功"和"某段工具输出里恰好引用了 `resumedAgentId`"分开。
+    /// 续跑判据落在**结果内容**上（`is_agent_resume_ack`），而内容匹配天生会被"读一次源码 /
+    /// 打印一次转录"污染 —— 与本文件里 `is_async_launch_ack` 的幽灵代理是同一个坑。
+    /// 先记下真调用过的 id，只对它们认内容，幽灵就不可能凭空出现。
+    pub send_message_ids: BTreeSet<String>,
 
     /// 这份转录里**最后一条带时间戳的行**是什么时候写的（epoch 秒）。
     ///
@@ -820,6 +941,19 @@ fn is_async_launch_ack(block: &Value) -> bool {
     ];
     let s = block.get("content").map(|c| c.to_string()).unwrap_or_default();
     MARKERS.iter().any(|m| s.contains(m))
+}
+
+/// 这条 `tool_result` 是不是**把已有子代理重新唤醒**的回执。
+///
+/// 形态（真机逐字，2026-10-26）：`{"success":true,"message":"Resuming agent aa0d0ab",
+/// "resumedAgentId":"aa0d0ab2b4467a410","pin":{…}}`。判据取**结构字段名**
+/// `resumedAgentId`，不取那句英文措辞 —— 措辞是 Claude Code 的实现细节，换个说法就静默失效。
+///
+/// ⚠️ 仅凭内容匹配会造出幽灵代理（见 `Delta::send_message_ids`），调用方必须同时确认这个
+/// `tool_use_id` 属于一次真正的 `SendMessage` 调用。
+fn is_agent_resume_ack(block: &Value) -> bool {
+    let s = block.get("content").map(|c| c.to_string()).unwrap_or_default();
+    s.contains("resumedAgentId")
 }
 
 /// 转录里的 RFC3339 时间戳（`2026-09-16T02:11:36.132Z`）→ epoch 秒。
@@ -994,6 +1128,13 @@ pub fn parse_delta(text: &str, prior: &Delta) -> Delta {
                                     d.pending_agents.insert(id.to_string());
                                 }
                             }
+                            // 续跑的子代理：这次调用有没有真的把代理唤醒，要等**结果**才知道
+                            // （见 `is_agent_resume_ack`）。先把 id 记下来当白名单。
+                            if name == SEND_MESSAGE_TOOL
+                                && let Some(id) = b.get("id").and_then(|i| i.as_str())
+                            {
+                                d.send_message_ids.insert(id.to_string());
+                            }
                             d.last_tool = Some(name.to_string());
                             let input = b.get("input").cloned().unwrap_or(Value::Null);
                             d.last_tool_detail = summarize_tool(name, &input);
@@ -1027,6 +1168,7 @@ pub fn parse_delta(text: &str, prior: &Delta) -> Delta {
                     let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str()) else {
                         continue;
                     };
+                    let is_send_message = d.send_message_ids.remove(id);
                     if is_async_launch_ack(b) {
                         // 后台代理：这一条是**启动回执**，从"在飞"挪到"后台在跑"。
                         //
@@ -1041,8 +1183,23 @@ pub fn parse_delta(text: &str, prior: &Delta) -> Delta {
                         if d.pending_agents.remove(id) {
                             d.bg_agents.insert(id.to_string());
                         }
+                    } else if is_send_message && is_agent_resume_ack(b) {
+                        // **续跑**：代理被 `SendMessage` 唤醒，又开始在后台干了。
+                        //
+                        // 它没有新的 `Agent` 调用，而主代理这边通常**紧接着就 `Stop`**
+                        // （数据已经交出去了）⇒ 不记这一笔的话，界面从这一刻到子代理干完
+                        // 都会写"完成"（用户 2026-10-26 报的就是这个）。
+                        //
+                        // 完成信号与后台代理完全相同：主转录里一条 `<task-notification>`，
+                        // 其 `<tool-use-id>` 实测**就是这条 `SendMessage` 的 id**
+                        // （本机 9 次续跑逐一核对过），所以复用 `bg_agents` 即可。
+                        d.bg_agents.insert(id.to_string());
                     } else {
                         // 前台代理：这一条就是结果，收工。
+                        //
+                        // `is_send_message` 为真但内容不是续跑（例如 "Message queued …"
+                        // 或发给别的 Claude 会话）：不是本会话多了一个在跑的子代理。
+                        // 白名单已在上面的 `remove` 里消费掉，这里不必再动它。
                         d.pending_agents.remove(id);
                         d.bg_agents.remove(id);
                     }
