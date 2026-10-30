@@ -402,6 +402,7 @@ pub fn run() -> eframe::Result<()> {
                 last_pos: None,
                 pos_stable_since: None,
                 dragging: None,
+                auto_fit_rows: None,
             }))
         }),
     )
@@ -1928,6 +1929,41 @@ fn draw_row(ui: &mut egui::Ui, row: &view::Row, ledger: &usage::LedgerView, bar_
     ui.add_space(EXTRA_ROW_GAP);
 }
 
+/// 这一帧量到的**纵向版面**，给"窗口跟着会话条数自动贴合"用（见 [`App::auto_fit`]）。
+///
+/// 为什么不在外面再推一遍常数：行高、顶栏高度、两条会话之间的前进量都随字号与字体栈
+/// 走，外面照抄一组数字，改字号那天就会**悄悄**贴合错（本仓"实测数字不保鲜"的老毛病）。
+/// 这里只报**这一帧真的量到的**，贴合用同一把尺子。
+#[derive(Clone, Copy, Debug)]
+struct PanelFit {
+    /// 内容区顶 → 第一条会话顶（顶栏 + 分隔线 + `HEADER_GAP`）。
+    header_h: f32,
+    /// 一条会话自己的内容高度（不含行尾与会话之间的空白）。
+    row_h: f32,
+    /// 相邻两条会话的前进量（`row_h + ROW_BOTTOM_GAP + EXTRA_ROW_GAP`）。
+    row_advance: f32,
+    /// "没有活跃会话"那一行的高度（没有会话时顶上去）。
+    empty_h: f32,
+    /// 这一帧内容区的高度（`ui.max_rect().height()`，不含面板内边距）。
+    available_h: f32,
+}
+
+impl PanelFit {
+    /// 装下 `n` 条会话所需的内容高度。
+    fn content_h(&self, n: usize) -> f32 {
+        if n == 0 {
+            self.header_h + self.empty_h
+        } else {
+            self.header_h + (n - 1) as f32 * self.row_advance + self.row_h
+        }
+    }
+
+    /// 要装下 `n` 条会话，内容区还差多少高度（负数 = 多出来多少）。
+    fn delta(&self, n: usize) -> f32 {
+        self.content_h(n) - self.available_h
+    }
+}
+
 /// 面板正文：顶栏 + 每行的「会名 + 状态 + 计时」/「上下文 + 子代理」两行。
 ///
 /// 抽出来是为了让无头测试能跑到**同一份**渲染代码（`draw_panel` 由 `App::ui` 与
@@ -1950,7 +1986,7 @@ fn draw_panel(
     ledger: &usage::LedgerView,
     first_scan_done: bool,
     cfg: &config::Config,
-) {
+) -> PanelFit {
     // 纵向空隙**全部显式给**（每处 `add_space`），把 egui 的隐式 `item_spacing.y` 清零。
     //
     // 不清零的后果（实测过）：`add_space(11)` 实际只加了 11，但"第一行→第二行"的
@@ -1988,18 +2024,9 @@ fn draw_panel(
     // 改前只有 6pt，比会话内部两行之间的 8pt 还紧，层级是倒的。见 `HEADER_GAP`。
     ui.add_space(HEADER_GAP);
 
-    if rows.is_empty() {
-        // ⚠️ **首轮扫描还没落地时不能画这句**：那一刻"空"的意思是"还不知道"，
-        // 不是"确实没有"（启动头一秒亮一句"没有活跃会话"再跳成好几条，是遗留 #6）。
-        if first_scan_done {
-            ui.label(
-                egui::RichText::new("没有活跃会话")
-                    .color(egui::Color32::from_rgb(0x6a, 0x6a, 0x6a))
-                    .size(STATE_SIZE),
-            );
-        }
-        return;
-    }
+    // ---- 这一帧的纵向版面（自动贴合要用）--------------------------------------
+    let content_top = ui.max_rect().top();
+    let header_h = ui.cursor().min.y - content_top;
     // 一条会话**自己的内容**要多高 = 第一行 + `ROW_LINE_GAP` + 第二行。
     //
     // ⚠️ 刻意**不含 `ROW_BOTTOM_GAP` 与那条分隔线**：它们属于"这一行**之后**的空白与装饰"
@@ -2011,6 +2038,27 @@ fn draw_panel(
         .max(text_height(ui, STATE_SIZE, egui::FontFamily::Proportional))
         + ROW_LINE_GAP
         + text_height(ui, CONTEXT_SIZE, egui::FontFamily::Proportional);
+    let row_advance = one_row_h + ROW_BOTTOM_GAP + EXTRA_ROW_GAP;
+    let metrics = PanelFit {
+        header_h,
+        row_h: one_row_h,
+        row_advance,
+        empty_h: text_height(ui, STATE_SIZE, egui::FontFamily::Proportional),
+        available_h: ui.max_rect().height(),
+    };
+
+    if rows.is_empty() {
+        // ⚠️ **首轮扫描还没落地时不能画这句**：那一刻"空"的意思是"还不知道"，
+        // 不是"确实没有"（启动头一秒亮一句"没有活跃会话"再跳成好几条，是遗留 #6）。
+        if first_scan_done {
+            ui.label(
+                egui::RichText::new("没有活跃会话")
+                    .color(egui::Color32::from_rgb(0x6a, 0x6a, 0x6a))
+                    .size(STATE_SIZE),
+            );
+        }
+        return metrics;
+    }
     // 先算出**这一屏真正画得下几条**（`fit`），颜色交给 `colors_for_display`：
     // 它拿**整份列表**的全局色，只在"可见的这几条撞了色"时才局部重排。
     //
@@ -2026,7 +2074,6 @@ fn draw_panel(
     // 第一版只除 `one_row_h`，算出"装得下 7 条"、实际只画 4 条（实测 start_y=41、
     // bottom=372、one_row_h=44 ⇒ 7；而每行前进 94pt ⇒ 真装 4 条），于是颜色是
     // **对着 7 条分配的**、看得见的 4 条里照样撞色。
-    let row_advance = one_row_h + ROW_BOTTOM_GAP + EXTRA_ROW_GAP;
     let fit = if bottom - start_y < one_row_h {
         0
     } else {
@@ -2044,6 +2091,7 @@ fn draw_panel(
         }
         draw_row(ui, row, ledger, colors.get(i).copied().unwrap_or_else(|| hash_color(&row.session_id)), cfg);
     }
+    metrics
 }
 
 /// 面板外观：**纯白底 + 粗黑描边**（用户裁定的小游戏 HUD 框感）。
@@ -2096,6 +2144,12 @@ struct App {
     ///
     /// 状态必须跨帧存活：按下那一帧只记录起点，之后每一帧都要拿它换算新几何。
     dragging: Option<DragSession>,
+
+    /// 上一次**自动贴合窗口高度**时看到的会话条数。`None` = 还没贴过。
+    ///
+    /// 只在**条数变化**时动手：每一帧都按内容重算的话，用户手动拉出来的高度会被
+    /// 立刻拽回去（那条路已经由拖动/缩放自己管）。条数没变就一律不碰。
+    auto_fit_rows: Option<usize>,
 }
 
 impl App {
@@ -2132,6 +2186,85 @@ impl App {
             self.saved_pos = cur_arr;
         }
     }
+
+    /// 会话条数变了 ⇒ 把窗口**高度**贴到"刚好装下"。
+    ///
+    /// 用户 2026-10-30："本来有四个会话，删去三个之后 HUD 应该缩小；增加会话则应该变大。"
+    ///
+    /// 三条闸门，每一条都对应一种"按条数无条件贴合"会弄坏的情形：
+    /// 1. **首轮扫描还没落地时不动** —— 那一刻的 0 行只是"还不知道"（见
+    ///    `SnapshotData::first_scan_done`），照它缩窗会在启动头一秒把窗口抽小再弹回来；
+    /// 2. **正在手动拖动/缩放时不动** —— 用户手里的事优先；松手后条数若仍与上次不同，
+    ///    下一轮自然会补上（`auto_fit_rows` 只在真的发过命令后才记账）；
+    /// 3. **条数没变时不动** —— 否则用户手动拉出来的高度每帧都会被拽回去。
+    ///
+    /// 宽度**一律不碰**（那是用户的排版偏好），只改高度。窗口以**左上角为锚**变高变矮；
+    /// 变高后若整窗会跑出屏幕，就把原点夹回来（与 2026-09-30「窗口跑到屏幕外」同一道保护）。
+    fn auto_fit(
+        &mut self,
+        ctx: &egui::Context,
+        rows: usize,
+        first_scan_done: bool,
+        metrics: &PanelFit,
+        monitor_at: &dyn Fn(egui::Pos2) -> Option<egui::Rect>,
+    ) {
+        if !first_scan_done || self.dragging.is_some() {
+            return;
+        }
+        if self.auto_fit_rows == Some(rows) {
+            return;
+        }
+
+        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        // 这一帧拿不到窗口几何（无头环境 / 窗口还没建好）时**不记账**：等有了再贴，
+        // 而不是把这次条数变化白白吃掉。
+        let Some(inner) = inner else { return };
+        let monitor = outer.and_then(|o| monitor_at(o.min + o.size() / 2.0));
+
+        self.auto_fit_rows = Some(rows);
+        let Some((size, pos)) = plan_auto_fit(rows, metrics, inner, outer, monitor) else {
+            return;
+        };
+        // 变高之后整窗仍要可见（与 2026-09-30「窗口跑到屏幕外」同一道保护）。
+        if let Some(pos) = pos {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+    }
+}
+
+/// "按会话条数贴合窗口"的**纯计算**部分：给定这一帧的版面和窗口几何，算出新的尺寸
+/// （以及必要时的新原点）。返回 `None` = 不用动。
+///
+/// 抽成纯函数是为了能钉住"到底算成多少" —— 它不依赖 egui 上下文，也不问系统要显示器；
+/// 取数（`monitor_at`）留在调用方，测试可以喂一块假屏幕。
+fn plan_auto_fit(
+    rows: usize,
+    metrics: &PanelFit,
+    inner: egui::Rect,
+    outer: Option<egui::Rect>,
+    monitor: Option<egui::Rect>,
+) -> Option<(egui::Vec2, Option<egui::Pos2>)> {
+    let mut height = (inner.height() + metrics.delta(rows)).max(MIN_INNER_HEIGHT);
+    // 上限 = 最近那块屏的高度：会话再多也不许把窗口长到屏幕外。
+    if let Some(monitor) = monitor {
+        height = height.min(monitor.height());
+    }
+    // 2pt 以内当作"不用动"：默认窗 320×380 装四条会话时差 1pt（实测量的余量），
+    // 为这 1pt 发一条窗口命令没有意义，还会让"启动后窗口是否跳了一下"变成一个话题。
+    if (height - inner.height()).abs() <= 2.0 {
+        return None;
+    }
+    let mut pos = None;
+    // 变高之后整窗仍要可见。`outer` 拿不到时不夹（宁可不夹，也不拿猜的坐标去推窗口）。
+    if let (Some(outer), Some(monitor)) = (outer, monitor) {
+        let new_outer = egui::vec2(outer.width(), outer.height() + (height - inner.height()));
+        let clamped = screen::clamp_origin(outer.min, new_outer, monitor);
+        if clamped != outer.min {
+            pos = Some(clamped);
+        }
+    }
+    Some((egui::vec2(inner.width(), height), pos))
 }
 
 impl eframe::App for App {
@@ -2169,6 +2302,7 @@ impl eframe::App for App {
         // 与数据新鲜度无关 —— 数据到了后台线程会额外唤醒一次。
         ui.ctx().request_repaint_after(Duration::from_millis(self.cfg.poll_interval_ms));
 
+        let mut metrics = None;
         egui::CentralPanel::default()
             .frame(panel_frame())
             .show(ui, |ui| {
@@ -2179,8 +2313,24 @@ impl eframe::App for App {
                     &screen::monitor_rect_at,
                     &cursor::left_button_down,
                 );
-                draw_panel(ui, &snap.rows, &snap.ledger, snap.first_scan_done, &self.cfg);
+                metrics = Some(draw_panel(
+                    ui,
+                    &snap.rows,
+                    &snap.ledger,
+                    snap.first_scan_done,
+                    &self.cfg,
+                ));
             });
+        // 画完再贴合：用的正是这一帧量到的行高与顶栏高度（见 `PanelFit`）。
+        if let Some(metrics) = metrics {
+            self.auto_fit(
+                ui.ctx(),
+                snap.rows.len(),
+                snap.first_scan_done,
+                &metrics,
+                &screen::monitor_rect_at,
+            );
+        }
     }
 
     /// 停掉后台轮询线程再让 eframe 拆上下文。睡眠是切片式的，最多等 50 ms。
@@ -3241,6 +3391,212 @@ mod tests {
         }
     }
 
+    // ---- 窗口随会话条数自动缩放（用户 2026-10-30）----------------------------
+
+    /// 自动贴合用例的版面夹具：数值取自默认窗 320×380 的真实量法，抽出来只为算账方便。
+    /// 真实值由 `the_auto_fit_metrics_are_measured_from_the_real_layout` 钉着。
+    fn auto_fit_fixture() -> PanelFit {
+        PanelFit {
+            header_h: 33.0,
+            row_h: 48.0,
+            row_advance: 94.0,
+            empty_h: 12.0,
+            available_h: 364.0, // 380 − 面板上下内边距 16
+        }
+    }
+
+    fn test_app() -> App {
+        App {
+            cfg: config::Config::default(),
+            snapshot: Arc::new(Mutex::new(SnapshotData::default())),
+            alive: Arc::new(AtomicBool::new(true)),
+            worker: None,
+            last_pos: None,
+            pos_stable_since: None,
+            saved_pos: [0.0, 0.0],
+            dragging: None,
+            auto_fit_rows: None,
+        }
+    }
+
+    /// 跑一帧 `App::auto_fit` 并取回它发出的窗口命令。窗口几何（屏幕 2560×1440、
+    /// 挂件 320×380 @ (100,100)）由夹具给，不去问真实桌面。
+    fn auto_fit_commands(
+        app: &mut App,
+        rows: usize,
+        first_scan_done: bool,
+        fit: &PanelFit,
+    ) -> Vec<egui::ViewportCommand> {
+        let ctx = egui::Context::default();
+        let inner = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(320.0, 380.0));
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(320.0, 380.0),
+            )),
+            ..Default::default()
+        };
+        raw.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                outer_rect: Some(inner),
+                inner_rect: Some(inner),
+                ..Default::default()
+            },
+        );
+        let monitor = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(2560.0, 1440.0));
+        let mut full = ctx.run_ui(raw, |_| {
+            app.auto_fit(&ctx, rows, first_scan_done, fit, &|_| Some(monitor));
+        });
+        full.textures_delta.clear();
+        // 只留几何命令：egui 自己每帧会发一条 `SetTheme`，与"这次贴不贴"无关。
+        full.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|o| {
+                o.commands
+                    .iter()
+                    .filter(|c| {
+                        matches!(
+                            c,
+                            egui::ViewportCommand::InnerSize(_) | egui::ViewportCommand::OuterPosition(_)
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn sent_inner_size_of(cmds: &[egui::ViewportCommand]) -> Option<egui::Vec2> {
+        cmds.iter().find_map(|c| match c {
+            egui::ViewportCommand::InnerSize(s) => Some(*s),
+            _ => None,
+        })
+    }
+
+    /// **自动贴合的依据必须是这一帧真的量到的版面**（不是外面抄的一组常数）。
+    #[test]
+    fn the_auto_fit_metrics_are_measured_from_the_real_layout() {
+        let rows: Vec<view::Row> = (0..4)
+            .map(|i| {
+                let mut r = row(&format!("会话{i}"), State::Done, 10 * (i + 1));
+                r.context_pct = Some(0.1 * (i + 1) as f32);
+                r
+            })
+            .collect();
+        let (_, fit) = run_frame_capture(
+            &rows,
+            DEFAULT_INNER_W,
+            DEFAULT_INNER_H,
+            &usage::LedgerView::default(),
+            true,
+            None,
+            &config::Config::default(),
+        );
+        assert!(fit.row_h > 0.0 && fit.row_advance > fit.row_h);
+        // 默认窗就是按"四条刚好装下"定的：四条不该要求长高，第五条必须要求长高。
+        assert!(
+            fit.delta(4) <= 0.0,
+            "默认尺寸必须装得下四条，实测还差 {}pt",
+            fit.delta(4)
+        );
+        assert!(
+            fit.delta(5) > 0.0,
+            "第五条会话放不下（delta {}），自动贴合应当长高",
+            fit.delta(5)
+        );
+        // 每多一条正好多一个前进量 —— 少三条就少三个（这正是"删掉会话要缩小"的依据）。
+        assert!(
+            (fit.delta(3) - (fit.delta(4) - fit.row_advance)).abs() < 0.01,
+            "少一条应当正好矮一个行距：delta(4)={} delta(3)={} advance={}",
+            fit.delta(4),
+            fit.delta(3),
+            fit.row_advance
+        );
+        assert!(fit.delta(0) < fit.delta(1), "没有会话时应当比一条时更矮");
+    }
+
+    #[test]
+    fn the_window_height_follows_the_session_count() {
+        let fit = auto_fit_fixture();
+        let inner = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(320.0, 380.0));
+        let monitor = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(2560.0, 1440.0));
+
+        // 四条 = 默认尺寸，刚好装下 ⇒ 不动。
+        assert!(
+            plan_auto_fit(4, &fit, inner, Some(inner), Some(monitor)).is_none(),
+            "四条会话在默认尺寸下已经装得下，不该发尺寸命令"
+        );
+
+        // 删到三条：高度 380 + delta(3)=−95 ⇒ 285。
+        let (size, pos) =
+            plan_auto_fit(3, &fit, inner, Some(inner), Some(monitor)).expect("三条应当缩窗");
+        assert_eq!(size, egui::vec2(320.0, 285.0), "只改高度，宽度一律不碰");
+        assert_eq!(pos, None, "窗口没出屏，原点不许动");
+
+        // 删到一条：算出来 97pt，但下限是"至少看得清一条会话"的 160。
+        let (size, _) =
+            plan_auto_fit(1, &fit, inner, Some(inner), Some(monitor)).expect("一条应当缩窗");
+        assert_eq!(size.y, MIN_INNER_HEIGHT, "不许缩到看不见一条会话");
+
+        // 增加到六条：380 + delta(6)=187 ⇒ 567。
+        let (size, _) =
+            plan_auto_fit(6, &fit, inner, Some(inner), Some(monitor)).expect("六条应当长高");
+        assert_eq!(size, egui::vec2(320.0, 567.0));
+    }
+
+    #[test]
+    fn a_taller_hud_is_pushed_back_inside_the_monitor() {
+        let fit = auto_fit_fixture();
+        // 窗口贴着屏幕底部：原点 y=100、高 380，屏幕只有 400 高。
+        let inner = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(320.0, 380.0));
+        let monitor = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(2560.0, 400.0));
+        let (size, pos) =
+            plan_auto_fit(6, &fit, inner, Some(inner), Some(monitor)).expect("六条应当长高");
+        assert_eq!(size.y, 400.0, "高度上限是整块屏幕");
+        assert_eq!(
+            pos,
+            Some(egui::pos2(100.0, 0.0)),
+            "变高后整窗会出屏，原点必须被夹回屏幕内"
+        );
+    }
+
+    /// 三个闸门：首扫没落地、正在手动拖、条数没变 —— 都不许动窗口。
+    /// （第四条"拿不到窗口几何"由 `auto_fit_commands` 之外的路径覆盖，见 `App::auto_fit`。）
+    #[test]
+    fn auto_fit_waits_for_the_first_scan_and_never_fights_the_user() {
+        let fit = auto_fit_fixture();
+
+        let mut app = test_app();
+        assert!(
+            auto_fit_commands(&mut app, 1, false, &fit).is_empty(),
+            "首轮扫描还没落地时 0 行只代表「还不知道」，不许照它缩窗"
+        );
+        // 那次没记账 ⇒ 首扫落地后照样会贴。
+        assert_eq!(
+            sent_inner_size_of(&auto_fit_commands(&mut app, 1, true, &fit)),
+            Some(egui::vec2(320.0, MIN_INNER_HEIGHT)),
+            "首扫落地后必须补上这次贴合"
+        );
+        // 同一条数再来一帧 ⇒ 什么都不发（否则用户手动拉出来的高度会被拽回去）。
+        assert!(
+            auto_fit_commands(&mut app, 1, true, &fit).is_empty(),
+            "条数没变时不许再改尺寸"
+        );
+
+        let mut app = test_app();
+        app.dragging = Some(DragSession {
+            kind: DragKind::Move,
+            outer: egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(320.0, 380.0)),
+            inner: egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(320.0, 380.0)),
+            pointer: egui::vec2(0.0, 0.0),
+        });
+        assert!(
+            auto_fit_commands(&mut app, 1, true, &fit).is_empty(),
+            "用户正在拖动/缩放，窗口归他管"
+        );
+    }
+
     /// **贴着窗口边按下再拖，窗口真的被缩放** —— 端到端，断言的是**发给窗口系统的几何**。
     ///
     /// 背景（2026-09-17，用户连着两次报"不能缩放"）：
@@ -3708,6 +4064,20 @@ mod tests {
         theme: Option<egui::Theme>,
         cfg: &config::Config,
     ) -> Vec<egui::Shape> {
+        run_frame_capture(rows, width, height, ledger, first_scan_done, theme, cfg).0
+    }
+
+    /// 与 [`run_frame_full`] 同一个实现，额外把这一帧量到的 [`PanelFit`] 带回来
+    /// （自动贴合用例要用它 —— 行高必须与真实渲染同一把尺子量）。
+    fn run_frame_capture(
+        rows: &[view::Row],
+        width: f32,
+        height: f32,
+        ledger: &usage::LedgerView,
+        first_scan_done: bool,
+        theme: Option<egui::Theme>,
+        cfg: &config::Config,
+    ) -> (Vec<egui::Shape>, PanelFit) {
         let cjk = pick_font(&font_candidates()).map(|(_, bytes)| bytes);
         let ctx = ctx_with_fonts(build_font_definitions(cjk));
         // 显式偏好（不是 `ThemePreference::System`）⇒ **不受跑测试这台机器的系统主题影响**，
@@ -3722,6 +4092,7 @@ mod tests {
             )),
             ..Default::default()
         };
+        let mut metrics = None;
         let mut full = ctx.run_ui(raw, |ui| {
             egui::CentralPanel::default()
                 .frame(panel_frame())
@@ -3730,13 +4101,13 @@ mod tests {
                     // 夹具默认传一本**空账本**（`total = 0`、`day = None`）——
                     // 于是顶栏不写"全部 N"，行尾都是 `0`。要测 token 显示的用例
                     // 走 `run_frame_with_ledger`。
-                    draw_panel(ui, rows, ledger, first_scan_done, cfg);
+                    metrics = Some(draw_panel(ui, rows, ledger, first_scan_done, cfg));
                 });
         });
         full.textures_delta.clear(); // 不 clear 会 panic（见拖拽用例的注释）
         let mut out = Vec::new();
         flatten(&full.shapes, &mut out);
-        out
+        (out, metrics.expect("draw_panel 必须跑过一次"))
     }
 
     fn painted_texts(shapes: &[egui::Shape]) -> String {

@@ -85,14 +85,185 @@ pub fn refresh(
 /// 空串一律当"没有"：`/rename ""` 之类的操作不该把标题清空成一片空白。
 fn apply_title(s: &mut SessionState, d: Option<&Delta>) {
     let Some(d) = d else { return };
-    let picked = [&d.custom_title, &d.ai_title, &d.first_prompt]
-        .into_iter()
-        .flatten()
-        .map(|t| t.trim())
-        .find(|t| !t.is_empty());
-    if let Some(t) = picked {
-        s.display_name = Some(t.to_string());
+    // 谁给的标题决定处不处理：`customTitle` 是**用户亲自起的**，一个字都不许动；
+    // 另外两档是机器猜的（AI 标题 / 第一句话），过长就要压短 —— 见 `simplify_title`。
+    let picked = [
+        (d.custom_title.as_deref(), true),
+        (d.ai_title.as_deref(), false),
+        (d.first_prompt.as_deref(), false),
+    ]
+    .into_iter()
+    .find_map(|(t, user_named)| {
+        t.map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| (t, user_named))
+    });
+    let Some((t, user_named)) = picked else { return };
+    let name = if user_named {
+        t.to_string()
+    } else {
+        simplify_title(t)
+    };
+    // 简化后为空（例如整句就是一个链接）= 这一档没有可用标题，**不要**把名字清空 ——
+    // 让下游继续用 cwd 末段兜底，好过画一行空白。
+    if !name.is_empty() {
+        s.display_name = Some(name);
     }
+}
+
+/// 一行会名的"显示宽度"上限：半角 1、全角 2。
+///
+/// 取 30 ≈ 15 个汉字（或 30 个拉丁字符）—— 默认 320pt 窗口里会名额度约 151pt
+/// （≈ 8.9 个汉字），所以它**不是**"到这儿就一定能完整显示"，而是"再长就只是噪音"：
+/// 剩下的由 `ui::row_name` 按实际宽度再加省略号，用户把窗口拉宽才看得到全文。
+const TITLE_MAX_UNITS: usize = 30;
+
+/// 第一个短句短于这个宽度时，再并上后面的分句（避免把"帮我"这种半个词当标题）。
+const TITLE_MIN_UNITS: usize = 8;
+
+/// 把机器猜出来的标题压成**一句短名**（用户没给会话起名时才走这里）。
+///
+/// 为什么要做：真机 370 份转录里 **223 份没有 `aiTitle`**，标题只能退回第一句
+/// 用户发言；这些 firstPrompt 的中位数是 **624 字符**（最长 8281）。直接画出来就是
+/// "窗口有多宽就露几个字"，读不出这个会话在干什么。用户 2026-10-30 的要求：
+/// "如果我没有对会话命名的情况下，对于长的标题要总结简化"。
+///
+/// 全部是**确定性的本地规则**（挂件不联网、不调模型）：
+/// 1. 去掉链接与长路径（`.../README.md` → `README.md`），压成单行；
+/// 2. 先按句末标点取第一句；第一句太长就按逗号/顿号这类软标点取前面的分句
+///    （首句短于 [`TITLE_MIN_UNITS`] 时并上下一句）；
+/// 3. 仍超过 [`TITLE_MAX_UNITS`] 就截断加 `…`（ASCII 单词不从中间切）。
+///
+/// 逗号后面那半句通常才是解释/补充，标题只留前半句 —— 例：
+/// "继续优化 hud，我希望能够自动缩放…" → **继续优化 hud**。
+fn simplify_title(raw: &str) -> String {
+    let one_line = collapse_title_text(raw);
+    if one_line.is_empty() {
+        return String::new();
+    }
+    // 第一句：句末标点（含分号）就断。句号本来就不该出现在标题里。
+    let sentence = one_line
+        .split(|c| matches!(c, '。' | '！' | '？' | '!' | '?' | '；' | ';'))
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c: char| " \t\u{3000}".contains(c));
+    if sentence.is_empty() {
+        return String::new();
+    }
+
+    // 按软标点取分句：够 `TITLE_MIN_UNITS` 就停；并下一句会超上限就停在上一句。
+    let mut out = String::new();
+    for clause in sentence.split(|c| matches!(c, '，' | ',' | '、' | '：' | ':' | '—' | '–')) {
+        let clause = clause.trim();
+        if clause.is_empty() {
+            continue;
+        }
+        let extra = if out.is_empty() { 0 } else { 1 }; // 分隔符占 1 个半角宽
+        if !out.is_empty() && units(&out) + extra + units(clause) > TITLE_MAX_UNITS {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('，');
+        }
+        out.push_str(clause);
+        if units(&out) >= TITLE_MIN_UNITS {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out = sentence.to_string();
+    }
+    // 分句都短、拼起来也没到下限时（"测试"），把整句截到上限，别留下半个意思。
+    if units(&out) < TITLE_MIN_UNITS && units(sentence) > units(&out) {
+        out = truncate_units(sentence, TITLE_MAX_UNITS);
+    }
+    truncate_units(&out, TITLE_MAX_UNITS)
+}
+
+/// 标题文本的预处理：去链接、长路径压成末段、压成单行、去掉开头的 Markdown 记号。
+fn collapse_title_text(raw: &str) -> String {
+    let mut s = strip_urls(raw)
+        .split_whitespace()
+        .map(shorten_path)
+        .collect::<Vec<_>>()
+        .join(" ");
+    // 开头的 `#` / `>` / `-` / `*` 是 Markdown 记号，不是话的一部分。
+    s = s
+        .trim_start_matches(|c: char| matches!(c, '#' | '>' | '-' | '*' | '`') || c.is_whitespace())
+        .to_string();
+    s.trim().to_string()
+}
+
+/// 把正文里的链接整段删掉。
+///
+/// ⚠️ **不能按空白分词再筛**：真机上的链接经常**直接粘在汉字后面**
+/// （`…不必完全按照之前这个来https://example.com/wiki/…`，中间没有空格），
+/// 按词筛会把它当成中文词的一部分留下来，标题就变成一串拼音域名。
+/// 链接的边界按"ASCII 可打印字符"走：遇到空白或汉字就结束。
+fn strip_urls(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if s[i..].starts_with("http://") || s[i..].starts_with("https://") {
+            while i < bytes.len() && bytes[i].is_ascii() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            // 不补空格：链接两侧本来有空格的话那些空格还在；紧贴汉字时直接删掉，
+            // 前后两个中文片段自然连成一句（比留一个突兀的半角空格更像人话）。
+            continue;
+        }
+        let ch = s[i..].chars().next().expect("i 恒在字符边界上");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 一个词如果长成路径（含 `:/` 或 `:\` 且够长），只留最后一段 —— 标题里没人要
+/// 看 `D:/公司项目/claude/工具/…` 这一串。
+fn shorten_path(word: &str) -> String {
+    if word.chars().count() <= 16 || !(word.contains(":/") || word.contains(":\\")) {
+        return word.to_string();
+    }
+    let tail = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    if tail.is_empty() { word.to_string() } else { tail.to_string() }
+}
+
+/// 显示宽度：半角 1、全角 2（与 [`TITLE_MAX_UNITS`] 同一把尺子）。
+fn units(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// 把 `s` 截到 `max` 个显示宽度以内，超了加 `…`；ASCII 单词不从中间切。
+fn truncate_units(s: &str, max: usize) -> String {
+    if units(s) <= max {
+        return s.to_string();
+    }
+    let mut kept = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = if c.is_ascii() { 1 } else { 2 };
+        if used + w > max {
+            break;
+        }
+        used += w;
+        kept.push(c);
+    }
+    // 别把拉丁单词切成半个：往回退到这个单词之前（中文照常从字间断）。
+    if let Some(last) = kept.chars().last()
+        && last.is_ascii_alphanumeric()
+        && s.chars().nth(kept.chars().count()).is_some_and(|c| c.is_ascii_alphanumeric())
+        && let Some(cut) = kept.rfind(|c: char| !c.is_ascii_alphanumeric())
+    {
+        kept.truncate(cut + 1);
+    }
+    let kept = kept.trim_end();
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!("{kept}…")
 }
 
 #[cfg(test)]
@@ -168,6 +339,85 @@ mod tests {
             Some("第一句话"),
             "最后退到第一条真实用户发言 —— **不再是 cwd 末段**（那正是三个会话同名的原因）"
         );
+    }
+
+    /// 用户 2026-10-30："如果我没有对会话命名的情况下，对于长的标题要总结简化。"
+    ///
+    /// 这些样本取自真机转录（`~/.claude/projects` 里没有 `customTitle` 的那批），
+    /// 不是编的句子 —— firstPrompt 的**中位数是 624 字符**，直接画就是"窗口多宽露几个字"。
+    #[test]
+    fn a_long_guessed_title_is_simplified_to_its_first_clause() {
+        let cases = [
+            // 句子很短就不用动（用户会看到完整的一句）。
+            ("写一下这个周的周报", "写一下这个周的周报"),
+            // 逗号后面是解释/补充，标题只留前半句。
+            (
+                "继续优化hud，我希望能够自动缩放，比如本来有四个会话",
+                "继续优化hud",
+            ),
+            ("继续示例项目，什么进度了", "继续示例项目"),
+            // 第一分句太短（"帮我"）就并上下一句，别把半个意思当标题。
+            ("帮我，看一下这个项目", "帮我，看一下这个项目"),
+            // 26 个半角宽（13 个汉字）仍在额度内，保留完整的一个分句。
+            (
+                "按照示例项目数据的最新一批，写一篇文档，要有流程图",
+                "按照示例项目数据的最新一批",
+            ),
+            // 英文从单词边界退回，不留半个词。
+            (
+                "Continue the AI deep-dive project, where were we?",
+                "Continue the AI deep-dive…",
+            ),
+            // 长路径只留末段：标题里没人要看 D:/公司项目/claude/工具/… 这一串。
+            (
+                "用 Read 工具读取文件 D:/公司项目/claude/工具/模型与环境测试/README.md",
+                "用 Read 工具读取文件 README.md",
+            ),
+            // 链接**粘在汉字后面**（真机上就是这样）：不能留下域名，也不能留下空格。
+            ("看这个https://a.b/c然后告诉我", "看这个然后告诉我"),
+            (
+                "按照示例项目数据的最新一批，写一篇文档，这是之前写的可以参考https://example.com/wiki/ABC",
+                "按照示例项目数据的最新一批",
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(simplify_title(raw), want, "输入 {raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_user_named_title_is_never_shortened() {
+        // `customTitle` 是用户亲手起的（`/rename`），一个字符都不许动。
+        let long = "这是我给会话起的名字，后面还有很多解释，一个字都不该被吃掉";
+        let mut d = Delta {
+            custom_title: Some(long.into()),
+            ai_title: Some("机器起的名字".into()),
+            first_prompt: Some("第一句话".into()),
+            ..Default::default()
+        };
+        let mut s = session(PathBuf::from("unused"));
+        apply_title(&mut s, Some(&d));
+        assert_eq!(s.display_name.as_deref(), Some(long));
+
+        // 没有 custom 时，机器猜的标题照样要简化。
+        d.custom_title = None;
+        d.ai_title = Some("继续示例系统，什么进度了".into());
+        s.display_name = None;
+        apply_title(&mut s, Some(&d));
+        assert_eq!(s.display_name.as_deref(), Some("继续示例系统"));
+    }
+
+    #[test]
+    fn a_title_that_simplifies_to_nothing_does_not_blank_the_name() {
+        // 整句就是一个链接：简化后没有可读内容 ⇒ **保持原样**（不要清空，也不要
+        // 拿一串 URL 当标题）。下游会退回 cwd 末段。
+        let mut s = session(PathBuf::from("unused"));
+        let d = Delta {
+            first_prompt: Some("https://example.com/wiki/DOC".into()),
+            ..Default::default()
+        };
+        apply_title(&mut s, Some(&d));
+        assert_eq!(s.display_name, None, "没有可读标题时不许写一个空串进去");
     }
 
     #[test]
