@@ -53,6 +53,24 @@ pub struct Row {
     /// 与 `Delta::bg_agents`）。
     /// **没有子代理时恒为 0**，界面据此**不画**这一段（而不是画一个 0）。
     pub subagent_count: u32,
+    /// **最近一次活动**（epoch 秒）—— 列表排序**只用它**。
+    ///
+    /// 用户 2026-10-30："HUD 的会话顺序和 VS Code 的顺序一致"（此前是 2026-09-17 裁定的
+    /// "错误 > 完成 > 待办 > 工作中，组内越久越靠前"）。VS Code 扩展的会话列表按
+    /// `lastModifiedTime` **降序**排（`webview/index.js` 里
+    /// `sessionsByLastModified` / `Xa()` 两处都是 `Z.lastModifiedTime.value - J.lastModifiedTime.value`；
+    /// 那个值来自 `lastActivity ?? lastModified`，即"最近一次活动/文件改动"），
+    /// 所以这里改成同一条口径：**最近活动的在最上面**，状态不再决定先后。
+    ///
+    /// **有转录就用转录最后一行的时刻**（`Delta::last_line_at`，最接近 VS Code 的
+    /// `lastModified` = 文件改动时间）；没有转录（会话刚建、文件还没落地）才退回
+    /// `max(last_event_at, state_since)`。
+    ///
+    /// ⚠️ **不要无条件把 `last_event_at` 取进来**：hook 对**每个**事件都刷它，
+    /// 而 `idle_prompt`（回合结束后约 59s 的 "Claude is waiting for your input"）
+    /// 也会刷新 —— 一条早已闲着的会话会因此每分钟"变新"，在列表里跳到刚干完活的会话上面。
+    /// 真机实测过这个时间差：`2f691f54` 的最后一行 16:12:57、`last_event_at` 16:13:57。
+    pub last_activity: i64,
     /// **宿主 Claude Code 进程已经不在了**（9b 的僵尸会话）。
     ///
     /// 由 `ui` 判存活后经 [`mark_host_gone`] 置位 —— **不在本模块里算**，因为判存活要调
@@ -70,7 +88,7 @@ pub struct Row {
 ///
 /// 用**稳定**的 `sort_by_key` 而不是重新算一遍完整排序键：非僵尸行保持
 /// `build_rows_with_deltas` 已经排好的顺序，僵尸行整体后移、彼此相对顺序也不变 ——
-/// 这样就不必把"最近活动时间"这个排序键的来源再抄一遍（它不在 `Row` 上）。
+/// 这样两条排序规则各管各的，不会把 [`Row::last_activity`] 的取值逻辑抄成第二份。
 pub fn mark_host_gone(rows: &mut [Row], gone: &std::collections::HashSet<String>) {
     if gone.is_empty() {
         return;
@@ -81,9 +99,13 @@ pub fn mark_host_gone(rows: &mut [Row], gone: &std::collections::HashSet<String>
     rows.sort_by_key(|r| r.host_gone);
 }
 
-/// 排序用的状态分组：**数值越小越靠前**。折叠态聚合与列表排序共用这一个顺序。
+/// 状态分组的优先级：**数值越小越靠前**。**现在只给折叠态聚合用**（[`aggregate`]）。
 ///
-/// 用户 2026-09-17 裁定的新口径（原话："工作中的会话放在下面，待办或者工作完毕的放在前面…
+/// ⚠️ **列表排序从 2026-10-30 起不用它了**：用户当天要求"HUD 的会话顺序和 VS Code
+/// 的顺序一致"，而 VS Code 是按最近活动降序（见 [`Row::last_activity`]）。下面这张表
+/// 仍然有效，但它回答的是"折叠成一颗胶囊时该报哪个状态"，不再是"谁排在上面"。
+///
+/// 用户 2026-09-17 裁定的口径（原话："工作中的会话放在下面，待办或者工作完毕的放在前面…
 /// 网络问题或者错误等优先级高于所有…完成的优先级高于待办"）：
 ///
 /// | 组 | 状态 | 为什么在这 |
@@ -134,8 +156,7 @@ pub fn build_rows_with_deltas(
     cfg: &Config,
     now: i64,
 ) -> Vec<Row> {
-    // 排序键就是 `Row` 自己（`elapsed_secs` = 进入当前状态多久），排完不需要丢弃任何东西。
-    let mut keyed: Vec<(Row, i64)> = states
+    let mut rows: Vec<Row> = states
         .iter()
         .map(|s| {
             let delta = deltas.get(&s.session_id);
@@ -188,7 +209,8 @@ pub fn build_rows_with_deltas(
             //   `Stop` 只要过了 5 分钟，"被通知唤醒的回合"就再也顶不上去了。真机场景：
             //   后台子代理跑 > 5 分钟 → 主代理被 `<task-notification>` 唤醒开新回合
             //   （这类回合**不发任何已注册事件**）⇒ 界面上一个正在烧 token 的会话写着"待命"、
-            //   计时还在走，排序还把它扔进"完成/待命"组排到前面。
+            //   计时还在走（旧排序还会把它扔进"完成/待命"组排到前面；2026-10-30 起排序
+            //   改成按最近活动，但**状态本身仍然是错的**，这条覆盖照旧要留着）。
             //   **判据本身（转录有没有动）才是真正的鉴别器**，所以放进 `Idle` 不会误伤：
             //   真空闲的会话 `last_line_at` 就停在 `last_event_at` 那一带（`Stop` 是读完转录
             //   才发的），过不了下面那道严格大于 + 2s 余量的关 —— 这条由用例里的**反向对照**
@@ -286,41 +308,49 @@ pub fn build_rows_with_deltas(
             // "读不到"不等于"有子代理在跑"，宁可少报也不凭空多画一段。
             // （它的计算已上移到状态判定那里 —— 状态覆盖要用到它。）
 
-            (
-                Row {
-                    session_id: s.session_id.clone(),
-                    name,
-                    state,
-                    elapsed_secs: (now - s.state_since).max(0),
-                    detail,
-                    context_tokens,
-                    context_limit: cfg.context_limit,
-                    context_pct,
-                    progress,
-                    subtitle,
-                    subagent_count,
-                    // `mark_host_gone` 之后才置位（它要 syscall，本模块保持纯函数）。
-                    host_gone: false,
-                },
-                s.last_event_at,
-            )
+            // 排序键见 `Row::last_activity`：与 VS Code 会话列表同一个口径
+            // （`lastActivity ?? lastModified` 降序）。转录在时以它为准 ——
+            // `last_event_at` 会被 `idle_prompt` 这类"不是用户活动"的事件顶新。
+            let last_activity = delta
+                .and_then(|d| d.last_line_at)
+                .unwrap_or_else(|| s.last_event_at.max(s.state_since));
+
+            Row {
+                session_id: s.session_id.clone(),
+                name,
+                state,
+                elapsed_secs: (now - s.state_since).max(0),
+                detail,
+                context_tokens,
+                context_limit: cfg.context_limit,
+                context_pct,
+                progress,
+                subtitle,
+                subagent_count,
+                last_activity,
+                // `mark_host_gone` 之后才置位（它要 syscall，本模块保持纯函数）。
+                host_gone: false,
+            }
         })
         .collect();
 
-    // 组内**一律"越久越靠前"**（用户 2026-09-17 裁定："越久没有处理的优先级越高"、
-    // "工作时间越长的优先级越高"，并且选了"四组统一这一条"）。
+    // **按最近活动降序**（用户 2026-10-30："HUD 的会话顺序和 VS Code 的顺序一致"）。
     //
-    // 判据是 `elapsed_secs` = 进入**当前状态**多久 —— 不是"最近一次活动"（那是旧口径：
-    // 同级按 `last_event_at` 降序）。两者在本机常常同向，但语义完全不同：
-    // 一条"工作中干了 40 分钟"的会话，最近一次活动是 2 秒前，按旧口径它会排到最后、
-    // 按新口径排到最前 —— 用户要的是后者。
-    keyed.sort_by(|(a, _), (b, _)| {
-        priority(a.state)
-            .cmp(&priority(b.state))
+    // VS Code 扩展的会话列表是 `lastModifiedTime` 降序（证据见 `Row::last_activity`），
+    // 与"按状态分组"无关 —— 用户要的是**整张列表**的顺序一致，所以这里不再看
+    // `priority(state)`。状态着色与"等待确认/出错"的提示词都不变，只是不再决定行号。
+    //
+    // 并列时（同一秒内两条都动过）再用"进入状态越久越靠前"和 session_id 兜底：
+    // 保 VS Code 的并列表现在本机是不可复现的，取一个**确定**顺序，
+    // 至少不会每帧抖来抖去。
+    rows.sort_by(|a, b| {
+        b.last_activity
+            .cmp(&a.last_activity)
             .then_with(|| b.elapsed_secs.cmp(&a.elapsed_secs))
+            .then_with(|| a.session_id.cmp(&b.session_id))
     });
 
-    keyed.into_iter().map(|(row, _)| row).collect()
+    rows
 }
 
 pub fn aggregate(rows: &[Row]) -> Option<State> {
@@ -351,52 +381,72 @@ mod tests {
         }
     }
 
-    /// **四组顺序**：错误 > 完成组（完成/被打断/待命）> 待办（等待确认）> 工作中（含压缩中）。
+    /// **整张列表按"最近活动"降序**（用户 2026-10-30："HUD 的会话顺序和 VS Code 的顺序一致"）。
     ///
-    /// 用户 2026-09-17 裁定。注意这与首版**正好相反**（首版是 等待确认 > 出错 > 工作中 > 完成/待命）。
+    /// VS Code 扩展按 `lastModifiedTime` 降序排（`webview/index.js` 的
+    /// `sessionsByLastModified`），与状态分组无关。夹具故意让**旧口径**（错误 > 完成 >
+    /// 待办 > 工作中）给出相反顺序 —— 对旧实现这条用例必红，不是空断言。
     #[test]
-    fn the_list_order_is_error_then_done_then_waiting_then_working() {
+    fn the_list_order_follows_last_activity_like_vs_code() {
         let states = vec![
-            st("working", "working", 0, 10),
-            st("waiting", "waiting", 0, 20),
-            st("done", "done", 0, 30),
-            st("error", "error", 0, 40),
-            st("idle", "idle", 0, 50),
-            st("interrupted", "interrupted", 0, 60),
-            st("compacting", "compacting", 0, 70),
+            st("error_oldest", "error", 0, 10),
+            st("done_middle", "done", 0, 20),
+            st("working_newest", "working", 0, 30),
+            st("waiting_older", "waiting", 0, 5),
         ];
         let rows = build_rows(&states, &Config::default(), 100);
         let order: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
         assert_eq!(
             order,
-            // 组内同 `state_since` ⇒ 并列，稳定排序保持输入顺序
-            vec!["error", "done", "idle", "interrupted", "waiting", "working", "compacting"],
-            "错误 > 完成(完成/待命/被打断) > 待办(等待确认) > 工作中(含压缩中)"
+            vec![
+                "working_newest",
+                "done_middle",
+                "error_oldest",
+                "waiting_older"
+            ],
+            "最近活动的在最上面，状态不决定先后"
+        );
+        assert_ne!(
+            order[0], "error_oldest",
+            "反向对照：旧口径（错误排第一）必须给出不同的首位"
         );
     }
 
-    /// **组内一律"越久越靠前"** —— 判据是"进入当前状态多久"，**不是**"最近有没有活动"。
+    /// `last_activity` **优先用转录最后一行的时刻**；没有转录才退回 `last_event_at`。
     ///
-    /// 用户原话："越久没有处理的优先级越高"、"工作时间越长的优先级越高"，
-    /// 并且选了"四组统一这一条"。
+    /// 关键是**不能无条件取两者的 max**：`idle_prompt`（回合结束后约 59 秒的
+    /// "Claude is waiting for your input"）也会刷 `last_event_at`，
+    /// 一条早就闲着的会话会因此"变新"并跳到刚干完活的会话上面。
     #[test]
-    fn within_a_group_the_longest_in_that_state_comes_first() {
-        // 两条都在"工作中"，但**两个时间字段故意相反**：
-        //   `long`：干了很久（since=0，elapsed=100），但**很久没活动**（last_at=10）
-        //   `just`：刚开始（since=90，elapsed=10），但**刚有过活动**（last_at=99）
-        //
-        // 于是新口径（按"进入状态多久"）排 long 在前，旧口径（按 last_at 降序）排 just 在前
-        // —— **夹具必须让两种口径给出相反结果**，否则这条用例测不出任何差别（空断言）。
-        let states = vec![st("just", "working", 90, 99), st("long", "working", 0, 10)];
-        assert!(
-            states[0].last_event_at > states[1].last_event_at,
-            "夹具失效：旧口径也会把 long 排前面，这条用例就白写了"
-        );
-        let rows = build_rows(&states, &Config::default(), 100);
-        assert_eq!(
-            rows[0].session_id, "long",
-            "工作时间越长越靠前（新口径按「进入状态多久」，不是「最近有没有活动」）"
-        );
+    fn last_activity_ignores_idle_notification_bumps() {
+        let states = vec![
+            // last_event_at=90 是 49 秒前那次 idle_prompt 顶出来的，转录停在 20。
+            st("idle_bumped", "done", 0, 90),
+            // 只有转录（没有可用事件时间）。
+            st("just_finished", "done", 0, 0),
+            // 没有转录（会话刚建、文件还没落地）⇒ 只能退回 last_event_at。
+            st("no_transcript", "working", 0, 95),
+        ];
+        let mut deltas = HashMap::new();
+        let mut d = Delta::default();
+        d.last_line_at = Some(20);
+        deltas.insert("idle_bumped".to_string(), d);
+        let mut d = Delta::default();
+        d.last_line_at = Some(50);
+        deltas.insert("just_finished".to_string(), d);
+
+        let rows = build_rows_with_deltas(&states, &deltas, &Config::default(), 100);
+        let act = |id: &str| {
+            rows.iter()
+                .find(|r| r.session_id == id)
+                .unwrap()
+                .last_activity
+        };
+        assert_eq!(act("idle_bumped"), 20, "idle_prompt 不许把活动时间顶新");
+        assert_eq!(act("just_finished"), 50);
+        assert_eq!(act("no_transcript"), 95, "没有转录时退回 last_event_at");
+        let order: Vec<&str> = rows.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(order, vec!["no_transcript", "just_finished", "idle_bumped"]);
     }
 
     #[test]
@@ -448,8 +498,8 @@ mod tests {
 
     #[test]
     fn aggregate_picks_highest_priority_state() {
-        // 与列表排序**共用** `priority`，所以它也随 2026-09-17 的新口径而变化：
-        // 完成组（这里用 `idle`）现在高于"待办"（`waiting`）。
+        // `priority` 从 2026-10-30 起**只给聚合用**（列表排序已改成按最近活动）；
+        // 这张表本身仍是 2026-09-17 的口径：完成组（这里用 `idle`）高于"待办"（`waiting`）。
         let states = vec![st("a", "idle", 0, 1), st("b", "working", 0, 2), st("c", "waiting", 0, 3)];
         let rows = build_rows(&states, &Config::default(), 100);
         assert_eq!(aggregate(&rows), Some(State::Idle), "完成组 > 待办 > 工作中");
@@ -685,8 +735,9 @@ mod wire_tests {
         //    ②③④⑤⑥ 的夹具全是 `state_since=100 / now=300`（相隔 200s < 阈值 300s），
         //    **一次都没跨过 `decay`**。而真机上"后台子代理跑超过 5 分钟"是常事 ——
         //    那时 `decay` 先把 `done@T0` 降级成 `Idle`，而覆盖只认 `Waiting | Done`
-        //    ⇒ **打不上**，界面上是一个正在烧 token 的会话写着"待命"，计时还在走，
-        //    排序还把它扔进"完成/待命"组排到前面（用户 09-17 拍板"工作中的放下边"）。
+        //    ⇒ **打不上**，界面上是一个正在烧 token 的会话写着"待命"，计时还在走
+        //    （旧排序还会把它扔进"完成/待命"组排到前面；排序现在已改按最近活动，
+        //    但"待命"这个状态词本身仍然是错的）。
         //    用户 09-16 报的那句"明明是在工作中，却显示工作完成"在这里**原样复发**。
         let done = at("done", 100);
         let rows = build_rows_with_deltas(
