@@ -664,6 +664,13 @@ D:\projects\claude-hud\
 > 发 `OuterPosition` + `InnerSize`；夹住最小尺寸时把**被拖的那条边顶回去**（否则会一边缩一边飘）。
 > 指针必须按**屏幕坐标**记账 —— 缩放会移动窗口（拖左边时原点跟着走），窗口内坐标会跳。
 >
+> ⚠️ **2026-10-30 补：屏幕坐标的口径统一成 egui 逻辑点。** Win32 的 `GetCursorPos` /
+> `GetMonitorInfoW` 返回的是**物理像素**，而 egui 的窗口矩形与 `OuterPosition/InnerSize`
+> 是逻辑点；100% 缩放下同值，125% / 150% 下混用会让窗口"跑得比鼠标快"、夹取也会失效。
+> 现在在 `handle_window_drag` 入口除以 `pixels_per_point`，显示器走
+> `screen::monitor_rect_at_points`，启动夹取挪到第一帧（`App::clamp_startup_position`，
+> 因为窗口建好前拿不到 ppp）。详见 `docs/兼容性检查-2026-10-30.md` §四.4。
+>
 > **光标**：贴边悬停时 `set_cursor_icon` 换成对应的缩放光标（横/竖/两个斜向）。
 > ✅ **2026-09-17 用户实机验收通过**（回话「好了」）—— 这是本轮唯一只能由人确认的一环。
 > 无边框窗口**没有系统给的那一份**，不自己设就永远是箭头 —— 用户就是这么发现"没生效"的。

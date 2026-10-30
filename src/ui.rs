@@ -298,7 +298,7 @@ pub fn run() -> eframe::Result<()> {
         }));
     }
     // `mut`：启动位置被夹回可见桌面时要**当场写回配置**（见下面"位置记忆"那段）
-    let mut cfg = config::load_from(&paths::real_config_path());
+    let cfg = config::load_from(&paths::real_config_path());
 
     // 中文字体**先探一次**（纯文件 IO，见 `pick_font`）。探测与安装分开，是因为
     // "取不到中文字体"这件事必须在**窗口出现之前**说出来；而安装要等 eframe 建好窗口
@@ -357,20 +357,13 @@ pub fn run() -> eframe::Result<()> {
     // `[-484, 603]`（当天是单屏 `0..2560` ⇒ 整窗落在左边界外）：进程好好活着、也在轮询，
     // 只是画在看不见的地方，而且此后每次启动都回到那里。
     //
-    // 夹完与配置里那份不一致时**当场写回**：否则每次启动都得再夹一遍，而且谁去读那份
-    // 配置都会被它误导（"坐标看着好好的，问题在别处"）。
+    //
+    // ⚠️ **夹取本身挪到了第一帧**（`App::clamp_startup_position`）：`screen` 的显示器
+    // 矩形是物理像素，而这里还没有 `pixels_per_point`（窗口没建），在 125% / 150% 下
+    // 直接夹会把单位混掉。这里只按配置放过去；第一帧拿到真实的窗口矩形与缩放后，
+    // 再夹一次并在需要时写回配置。
     if config::plausible_window_pos(cfg.window_pos) {
-        let want = egui::pos2(cfg.window_pos[0], cfg.window_pos[1]);
-        // 启动这一刻的窗口尺寸就是默认那份：尺寸**不持久化**（配置里只有 `window_pos`）
-        let size = egui::vec2(DEFAULT_INNER_W, DEFAULT_INNER_H);
-        let start = screen::clamp_onto_nearest_monitor(want, size);
-        if start != want {
-            cfg.window_pos = [start.x, start.y];
-            // 写失败**不打扰用户**（与 `remember_window_pos` 同）：这一趟已经夹住了，
-            // 代价只是"下次启动再夹一遍"。
-            let _ = config::save_to(&paths::real_config_path(), &cfg);
-        }
-        viewport = viewport.with_position(start);
+        viewport = viewport.with_position(egui::pos2(cfg.window_pos[0], cfg.window_pos[1]));
     }
 
     let opts = eframe::NativeOptions { viewport, ..Default::default() };
@@ -403,6 +396,7 @@ pub fn run() -> eframe::Result<()> {
                 pos_stable_since: None,
                 dragging: None,
                 auto_fit_rows: None,
+                startup_clamped: false,
             }))
         }),
     )
@@ -1006,6 +1000,19 @@ fn handle_window_drag(
     // 写在调用方会出现"测试测不到真实行为"的假绿（第一版就写在了调用方，测试直接红）。
     ui.style_mut().interaction.selectable_labels = false;
 
+    // ⚠️ **单位边界**：Win32 的 `GetCursorPos` / `GetMonitorInfoW` 返回**物理像素**，
+    // 而 egui 的窗口矩形、指针位置、`OuterPosition` / `InnerSize` 都是**逻辑点**。
+    // 2026-10-30 之前这里从未换算 —— 100% 缩放下两者同值所以看不出来；125% / 150%
+    // 下拖动会"跑得比鼠标快"，夹取也会失效（见 `docs/兼容性检查-2026-10-30.md`）。
+    // 现在在进入本函数的第一刻统一换成点：之后所有拖拽数学只跟点打交道，
+    // 发命令时不用再换一次。`monitor_at` 也约定为**点的坐标系**（生产传
+    // `screen::monitor_rect_at_points`，它内部换回物理像素去问系统）。
+    let ppp = match ui.ctx().pixels_per_point() {
+        p if p.is_finite() && p > 0.0 => p,
+        _ => 1.0,
+    };
+    let cursor_points = || cursor_screen().map(|p| p / ppp);
+
     let rect = window_rect(ui);
 
     // ---- 光标形状：**贴边时必须变成缩放光标** ----
@@ -1066,7 +1073,7 @@ fn handle_window_drag(
         // 按下那一刻的光标**屏幕坐标**：优先向系统要（与窗口位置无关，见 `cursor` 模块）。
         // 万一要不到（极少见），退回"窗口原点 + 指针窗口内坐标"——**按下这一刻窗口
         // 确实还没动**，所以这个折算此刻是准的；之后每帧都会重新向系统要。
-        let pointer = cursor_screen().unwrap_or_else(|| {
+        let pointer = cursor_points().unwrap_or_else(|| {
             outer.min.to_vec2()
                 + ctx.input(|i| i.pointer.press_origin()).unwrap_or_default().to_vec2()
         });
@@ -1088,7 +1095,7 @@ fn handle_window_drag(
         // 本仓坑 #9 的老教训：事件驱动的状态必须有一条证据驱动的兜底。
         if response.dragged() && left_button_down() {
             // 拿不到光标就**这一帧什么都不做**（少发一帧命令无害；拿错数会把窗口推着跑）。
-            if let Some(c) = cursor_screen() {
+            if let Some(c) = cursor_points() {
                 apply_drag(ui.ctx(), session, c, monitor_at);
             }
         } else if response.drag_stopped() || !response.is_pointer_button_down_on() || !left_button_down()
@@ -1164,6 +1171,9 @@ struct DragSession {
 /// ⚠️ **移动**（`DragKind::Move`）同样吃这条纪律：位移也一律从"按下时的几何 + 光标位移"
 /// 算出来，**绝不从当前窗口几何往回推** —— 否则同一个回路立刻出现（窗口每动一下，
 /// "它自己的位移"就被当成"鼠标又动了"）。这正是把移动与缩放收进同一个函数的原因。
+/// ⚠️ **单位**：`cursor_now`、`session` 里的几何、`monitor_at` 的输入输出**全是 egui
+/// 逻辑点**。物理像素只在 `handle_window_drag` 的入口换一次（光标）和 `screen` 的
+/// 点版本函数里换一次（显示器）—— 本函数内部不许出现物理像素。
 fn apply_drag(
     ctx: &egui::Context,
     session: &mut DragSession,
@@ -2150,9 +2160,52 @@ struct App {
     /// 只在**条数变化**时动手：每一帧都按内容重算的话，用户手动拉出来的高度会被
     /// 立刻拽回去（那条路已经由拖动/缩放自己管）。条数没变就一律不碰。
     auto_fit_rows: Option<usize>,
+
+    /// 启动时的"夹回可见桌面"是否已经做过。
+    ///
+    /// 这一步需要 `pixels_per_point`（把逻辑点和显示器物理像素换算），而窗口建好之前
+    /// 拿不到，所以从 `run()` 挪到了第一帧。`outer_rect` 还拿不到时保持 `false`，
+    /// 下一帧再试。
+    startup_clamped: bool,
 }
 
 impl App {
+    /// 启动时把窗口夹回**可见桌面**，并在夹动之后写回配置。
+    ///
+    /// 这一步原先是 `run()` 里做的（窗口出现前），但那里拿不到 `pixels_per_point`：
+    /// 显示器矩形是**物理像素**、窗口位置是**逻辑点**，在 125% / 150% 缩放下直接夹会把
+    /// 单位混掉（2026-10-30 兼容性检查的 P1）。现在推迟到第一帧：`outer_rect` 与
+    /// `pixels_per_point` 都有了，再按点坐标系夹。
+    ///
+    /// 代价：配置里的屏幕外坐标会让窗口在**第一帧**出现在屏幕外，下一帧被拉回来 ——
+    /// 一帧的闪烁，换来的是所有缩放比例下都算得对。`outer_rect` 拿不到时保持未完成，
+    /// 下一帧再试。
+    fn clamp_startup_position(&mut self, ctx: &egui::Context) {
+        if self.startup_clamped {
+            return;
+        }
+        let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else {
+            return; // 窗口还没建好：下一帧再试
+        };
+        let size = outer.size();
+        if !(size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0) {
+            return;
+        }
+        self.startup_clamped = true;
+
+        let clamped =
+            screen::clamp_onto_nearest_monitor_points(outer.min, size, ctx.pixels_per_point());
+        if clamped == outer.min {
+            return;
+        }
+        self.cfg.window_pos = [clamped.x, clamped.y];
+        self.saved_pos = [clamped.x, clamped.y];
+        // 写失败**不打扰用户**（与 `remember_window_pos` 同）：这一趟已经夹住了，
+        // 代价只是"下次启动再夹一遍"。
+        let _ = config::save_to(&paths::real_config_path(), &self.cfg);
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(clamped));
+    }
+
     /// 记住窗口位置。**每帧调用**，但只有"停稳且真的动了"时才写盘。
     ///
     /// 位置从 `viewport().outer_rect` 取（外框原点）—— 无边框窗口的 outer 与 inner
@@ -2175,7 +2228,11 @@ impl App {
         // 拖动那条路已经被夹住了（`apply_drag`），这里挡的是**运行中显示器变了**
         // （拔屏、改分辨率）之后 egui 报回来的那个"新位置"—— 把它记下来，
         // 等于把下次启动也一起赔进去。
-        let on_screen = screen::clamp_onto_nearest_monitor(cur, outer.size()) == cur;
+        // 单位：`cur` / `outer.size()` 是 egui 点，显示器矩形是物理像素 ——
+        // 交给点版本的夹取函数换算后再比（高 DPI 下不能直接拿两套坐标比较）。
+        let on_screen =
+            screen::clamp_onto_nearest_monitor_points(cur, outer.size(), ctx.pixels_per_point())
+                == cur;
         if !should_save_pos(cur_arr, self.saved_pos, stable_for, on_screen) {
             return;
         }
@@ -2294,6 +2351,10 @@ impl eframe::App for App {
             .map(|r| r.clone())
             .unwrap_or_default();
 
+        // 启动时**先**把窗口夹回可见桌面（要 `pixels_per_point`，而窗口建好之前拿不到，
+        // 所以这一步从 `run()` 挪到了这里；见 `clamp_startup_position`）。
+        self.clamp_startup_position(ui.ctx());
+
         // 窗口位置记忆：拖完之后**停稳 1 秒**才写一次配置（判据是纯函数 `should_save_pos`，
         // 单测钉着）。这里是渲染线程里唯一的写盘，且只在"真的动了"时发生。
         self.remember_window_pos(ui.ctx());
@@ -2301,6 +2362,10 @@ impl eframe::App for App {
         // 时间相关的显示（"00:12" 计时、done→idle 降级）仍需要按 poll_interval_ms 重绘，
         // 与数据新鲜度无关 —— 数据到了后台线程会额外唤醒一次。
         ui.ctx().request_repaint_after(Duration::from_millis(self.cfg.poll_interval_ms));
+
+        // Win32 侧（光标 / 显示器）是物理像素，egui 几何是逻辑点；在入口统一换算一次。
+        let ppp = ui.ctx().pixels_per_point();
+        let monitor_at = |p: egui::Pos2| screen::monitor_rect_at_points(p, ppp);
 
         let mut metrics = None;
         egui::CentralPanel::default()
@@ -2310,7 +2375,7 @@ impl eframe::App for App {
                     ui,
                     &mut self.dragging,
                     &cursor::screen_pos,
-                    &screen::monitor_rect_at,
+                    &monitor_at,
                     &cursor::left_button_down,
                 );
                 metrics = Some(draw_panel(
@@ -2328,7 +2393,7 @@ impl eframe::App for App {
                 snap.rows.len(),
                 snap.first_scan_done,
                 &metrics,
-                &screen::monitor_rect_at,
+                &monitor_at,
             );
         }
     }
@@ -3037,6 +3102,94 @@ mod tests {
         }
     }
 
+    /// **150% 缩放下拖动必须 1:1 跟随光标（按物理像素算）**。
+    ///
+    /// Win32 的光标是物理像素，窗口几何是逻辑点。旧实现把物理位移直接加到逻辑原点上：
+    /// 150% 下光标走 15px、窗口走 15pt = 22.5px，越拖越偏。这条夹具同时喂两套数：
+    /// 指针事件是**逻辑点**（走 10pt），`FakeCursor` 是**物理像素**（走 15px）——
+    /// 只有换算过一次，两者才会落在同一个点上。
+    #[test]
+    fn a_drag_at_150_percent_follows_the_cursor_in_physical_pixels() {
+        // 必须用**发货用的字体栈**：`draw_panel` 会走 `TEXT_FAMILY`，裸 Context 没绑字体。
+        let cjk = pick_font(&font_candidates()).map(|(_, bytes)| bytes);
+        let ctx = ctx_with_fonts(build_font_definitions(cjk));
+        let ppp = 1.5;
+        let origin = egui::pos2(100.0, 100.0);
+        let size = egui::vec2(320.0, 380.0);
+        let cur = FakeCursor::new(); // 物理像素
+        let src = cur.src();
+        let mut dragging = None;
+        // `monitor_at` 约定为**逻辑点**坐标系（与 `App::ui` 传给它的生产版本一致）。
+        let monitor_points = |_p: egui::Pos2| {
+            Some(egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1280.0, 720.0),
+            ))
+        };
+        let mut frame = |events: Vec<egui::Event>| -> Vec<egui::ViewportCommand> {
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1280.0, 720.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            raw.viewports.insert(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    outer_rect: Some(egui::Rect::from_min_size(origin, size)),
+                    inner_rect: Some(egui::Rect::from_min_size(origin, size)),
+                    native_pixels_per_point: Some(ppp),
+                    ..Default::default()
+                },
+            );
+            let mut full = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default()
+                    .frame(panel_frame())
+                    .show(ui, |ui| {
+                        handle_window_drag(ui, &mut dragging, &src, &monitor_points, &|| true);
+                        draw_panel(
+                            ui,
+                            &[],
+                            &usage::LedgerView::default(),
+                            true,
+                            &config::Config::default(),
+                        );
+                    });
+            });
+            full.textures_delta.clear();
+            full.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map(|o| o.commands.clone())
+                .unwrap_or_default()
+        };
+
+        let press = origin + size / 2.0; // 逻辑点
+        let press_px = press.to_vec2() * ppp; // 物理像素
+        cur.set(press_px.x, press_px.y);
+        frame(vec![]);
+        frame(vec![egui::Event::PointerMoved(press)]);
+        let _ = frame(vec![egui::Event::PointerButton {
+            pos: press,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }]);
+
+        // 光标物理走了 15px；对 egui 来说指针走了 10pt。二者是同一个位移。
+        cur.set(press_px.x + 15.0, press_px.y);
+        let moved = frame(vec![egui::Event::PointerMoved(
+            press + egui::vec2(10.0, 0.0),
+        )]);
+        let p = last_outer(&moved).expect("移动帧必须发 OuterPosition");
+        assert!(
+            (p.x - (origin.x + 10.0)).abs() < 0.01,
+            "150% 下光标走 15px（=10pt），窗口应走 10pt；实测到 {p:?}（没换算会走 15pt）"
+        );
+        assert!((p.y - origin.y).abs() < 0.01);
+    }
+
     /// **缩放必须收敛**：光标在屏幕上不动时，窗口几何一帧都不许变。
     ///
     /// 这是 2026-09-17「拖动很慢 → 然后卡死」的**回归测试**。真实数据（自动模拟按住左缘
@@ -3416,6 +3569,7 @@ mod tests {
             saved_pos: [0.0, 0.0],
             dragging: None,
             auto_fit_rows: None,
+            startup_clamped: false,
         }
     }
 

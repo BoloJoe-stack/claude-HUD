@@ -76,7 +76,10 @@ unsafe extern "system" {
 /// 正是我们要的语义 —— 夹取的目标就是"离它想去的地方最近的那块屏幕"。
 const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
-/// 离 `p` 最近的显示器矩形（屏幕坐标；本机 `pixels_per_point = 1.0`，物理像素与点同值）。
+/// 离 `p` 最近的显示器矩形，**物理像素**（`GetMonitorInfoW` 的原生单位）。
+///
+/// ⚠️ egui 的窗口几何是**逻辑点**：要拿它跟窗口矩形比较，用
+/// [`monitor_rect_at_points`]（内部按 `pixels_per_point` 换算），**不要直接混用**。
 ///
 /// 用 `rcMonitor`（**整块屏幕**）而不是 `rcWork`（扣掉任务栏）：夹取只在"要出界"时才生效，
 /// 而"把挂件停在任务栏那一条上"是用户可能有意为之的事，不该被我们悄悄推回去。
@@ -124,6 +127,32 @@ pub fn monitor_rect_at(p: Pos2) -> Option<Rect> {
     ))
 }
 
+/// 物理像素矩形 → egui **逻辑点**矩形。
+///
+/// Win32 的显示器/光标 API 一律返回物理像素，而 egui 的窗口矩形与
+/// `ViewportCommand::OuterPosition/InnerSize` 都是逻辑点（`egui-winit` 里明写
+/// `outer_rect_px / pixels_per_point`）。两者**必须在边界上换算一次**，否则在
+/// 125% / 150% 缩放下拖动与夹取全会错位（2026-10-30 的兼容性检查 P1）。
+///
+/// 纯函数 ⇒ 能被单测钉住（无需真有显示器）。
+pub fn physical_rect_to_points(r: Rect, ppp: f32) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(r.min.x / ppp, r.min.y / ppp),
+        Pos2::new(r.max.x / ppp, r.max.y / ppp),
+    )
+}
+
+/// [`monitor_rect_at`] 的**逻辑点版本**：查询点先换成物理像素，结果再换回点。
+///
+/// `ppp` 非法（0 / NaN / 无穷）时返回 `None` —— 调用方**不夹**，而不是拿一个
+/// 除零后的矩形去推窗口（与 `cursor` 那条"拿不到就什么都不做"同一纪律）。
+pub fn monitor_rect_at_points(p: Pos2, ppp: f32) -> Option<Rect> {
+    if !(ppp.is_finite() && ppp > 0.0) {
+        return None;
+    }
+    monitor_rect_at(Pos2::new(p.x * ppp, p.y * ppp)).map(|r| physical_rect_to_points(r, ppp))
+}
+
 /// 把窗口原点夹进 `bounds`：**整窗可见**；`bounds` 比窗口还小时（显示器小于窗口）贴它的左上角。
 ///
 /// 纯函数 ⇒ 能被单测钉住（真实显示器尺寸不由我们摆布）。多显示器下 `bounds` 仍是单块屏幕的
@@ -165,9 +194,12 @@ pub fn clamp_with(pos: Pos2, size: Vec2, monitor_at: &dyn Fn(Pos2) -> Option<Rec
     }
 }
 
-/// [`clamp_with`] 的生产版本：[`monitor_rect_at`] 真去问系统。
-pub fn clamp_onto_nearest_monitor(pos: Pos2, size: Vec2) -> Pos2 {
-    clamp_with(pos, size, &monitor_rect_at)
+/// [`clamp_with`] 的生产版本，**输入输出都是 egui 逻辑点**（内部换算成物理像素去问系统）。
+pub fn clamp_onto_nearest_monitor_points(pos: Pos2, size: Vec2, ppp: f32) -> Pos2 {
+    if !(ppp.is_finite() && ppp > 0.0) {
+        return pos;
+    }
+    clamp_with(pos, size, &|p| monitor_rect_at_points(p, ppp))
 }
 
 #[cfg(test)]
@@ -262,6 +294,30 @@ mod tests {
             clamp_origin(Pos2::new(1.0e9, 100.0), Vec2::new(f32::NAN, 380.0), s),
             Pos2::new(1.0e9, 100.0),
             "尺寸算不出来时也一样：原样返回，不许把它变成一个看起来合法的坐标"
+        );
+    }
+
+    /// **物理像素 → 逻辑点**：125% / 150% 下显示器矩形要按比例缩回点。
+    /// 这是 2026-10-30 兼容性检查里 P1（高 DPI 拖动/夹取错位）的换算口径。
+    #[test]
+    fn physical_pixels_are_converted_to_points_at_the_display_scale() {
+        let physical = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(2560.0, 1440.0));
+        let at_125 = physical_rect_to_points(physical, 1.25);
+        assert_eq!(at_125.min, Pos2::ZERO);
+        assert_eq!(at_125.max, Pos2::new(2048.0, 1152.0));
+
+        let at_150 = physical_rect_to_points(physical, 1.5);
+        assert!((at_150.max.x - 1706.6667).abs() < 0.01);
+        assert!((at_150.max.y - 960.0).abs() < 0.01);
+
+        // ppp 非法 ⇒ 取数口返回 None（不夹），而不是除零得到一个假矩形。
+        assert!(monitor_rect_at_points(Pos2::ZERO, 0.0).is_none());
+        assert!(monitor_rect_at_points(Pos2::ZERO, f32::NAN).is_none());
+        let p = Pos2::new(-484.0, 603.0);
+        assert_eq!(
+            clamp_onto_nearest_monitor_points(p, widget(), f32::NAN),
+            p,
+            "算不出缩放就不许动窗口"
         );
     }
 
