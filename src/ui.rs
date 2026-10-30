@@ -3949,8 +3949,6 @@ mod tests {
             progress: Progress::Steps(12),
             subtitle: Some("已修复排版，共 12 处".into()),
             subagent_count: 0,
-            // 排序键（本文件里的夹具不测排序；`view` 的用例钉它）。
-            last_activity: 0,
             host_gone: false,
         }
     }
