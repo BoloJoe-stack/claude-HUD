@@ -460,6 +460,176 @@ mod parse_tests {
     }
 
 
+    // ---- 后台命令（`Bash` 的 `run_in_background`）------------------------------
+    //
+    // 真机形态（2026-10-26，会话 `03ac8712`，逐字）：
+    //   ① assistant：`tool_use` 名 `Bash`、`input.run_in_background == true`；
+    //   ② user：`tool_result` 的正文是 "Command running in background with ID: b6h12wle0…"，
+    //      **顶层** `toolUseResult.backgroundTaskId == "b6h12wle0"`（这才是结构判据）；
+    //   ③ queue-operation：`<task-notification>` 里 `<task-id>b6h12wle0</task-id>` 与
+    //      `<tool-use-id>call_…</tool-use-id>`（= 发起它的那次 `Bash` 调用）。
+    // 与本文件里子代理的两条判据一一对应，坑也一样（回执是"已启动"不是"已完成"）。
+
+    fn bg_bash_use(id: &str) -> String {
+        json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use", "id": id, "name": "Bash",
+                  "input": { "command": "py -3.10 run.py", "run_in_background": true } }
+            ]}
+        })
+        .to_string()
+    }
+
+    fn bg_bash_ack(id: &str, task_id: &str) -> String {
+        json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": id, "is_error": false,
+                  "content": format!("Command running in background with ID: {task_id}. Output is being written to: …\\tasks\\{task_id}.output") }
+            ]},
+            "toolUseResult": { "stdout": "", "stderr": "", "backgroundTaskId": task_id }
+        })
+        .to_string()
+    }
+
+    fn task_notification(task_id: &str, tool_use_id: &str) -> String {
+        json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": format!(
+                "<task-notification>\n<task-id>{task_id}</task-id>\n<tool-use-id>{tool_use_id}</tool-use-id>\n<output-file>…</output-file>\n<status>completed</status>\n<summary>Background command done</summary>\n</task-notification>"
+            )
+        })
+        .to_string()
+    }
+
+    fn task_stop_use(id: &str, task_id: &str) -> String {
+        json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "tool_use", "id": id, "name": "TaskStop",
+                  "input": { "task_id": task_id } }
+            ]}
+        })
+        .to_string()
+    }
+
+    fn task_stop_result(id: &str, ok: bool) -> String {
+        json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "tool_use_id": id, "is_error": !ok,
+                  "content": if ok { "{\"message\":\"Successfully stopped task\"}" }
+                             else { "<tool_use_error>No task found with ID</tool_use_error>" } }
+            ]}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_background_command_counts_until_its_completion_notification() {
+        // ③ 之前：**必须**算在跑。回执是"已启动"，按普通回执处理会当场当成跑完 ——
+        // 用户报的"后台在运行程序，但是 HUD 不显示"正是这一步漏了。
+        let start = format!("{}\n{}\n", bg_bash_use("call_b1"), bg_bash_ack("call_b1", "b6h12wle0"));
+        let d = parse_delta(&start, &Delta::default());
+        assert_eq!(d.bg_tasks.len(), 1, "后台命令启动后必须算「在跑」：{:?}", d.bg_tasks);
+        assert_eq!(d.bg_tasks.get("b6h12wle0").map(String::as_str), Some("call_b1"));
+
+        // ③ 完成通知（注意：**主转录里的一条 queue-operation**，不在 tool_result 上）
+        let d2 = parse_delta(&format!("{}\n", task_notification("b6h12wle0", "call_b1")), &d);
+        assert!(d2.bg_tasks.is_empty(), "完成通知之后必须清掉：{:?}", d2.bg_tasks);
+    }
+
+    #[test]
+    fn a_notification_with_only_a_task_id_still_clears_the_command() {
+        // 真机通知**两个字段都有**（`<task-id>` 与 `<tool-use-id>`），所以上面那条用例
+        // 走的是 `tool-use-id` 那条路。这里单独钉 `<task-id>` 那条：它是**按值**清的，
+        // 作为"哪天 Claude Code 少写一个字段"的冗余 —— 没有这条用例，它就是没人守的代码。
+        let start = format!("{}\n{}\n", bg_bash_use("call_b1"), bg_bash_ack("call_b1", "b6h12wle0"));
+        let d = parse_delta(&start, &Delta::default());
+        let only_task_id = json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "<task-notification>\n<task-id>b6h12wle0</task-id>\n<status>completed</status>\n</task-notification>"
+        })
+        .to_string();
+        let d2 = parse_delta(&format!("{only_task_id}\n"), &d);
+        assert!(d2.bg_tasks.is_empty(), "只有 <task-id> 的通知也要能清掉：{:?}", d2.bg_tasks);
+    }
+
+    #[test]
+    fn a_notification_with_only_a_tool_use_id_still_clears_the_command() {
+        // 与上一条对称：只有 `<tool-use-id>`、没有 `<task-id>` 时，按**发起调用的 id**
+        // 也要清得掉（`bg_tasks` 的值就是它）。两条路各有一条用例，少一个字段都不漏。
+        let start = format!("{}\n{}\n", bg_bash_use("call_b1"), bg_bash_ack("call_b1", "b6h12wle0"));
+        let d = parse_delta(&start, &Delta::default());
+        let only_tool_use = json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "<task-notification>\n<tool-use-id>call_b1</tool-use-id>\n<status>completed</status>\n</task-notification>"
+        })
+        .to_string();
+        let d2 = parse_delta(&format!("{only_tool_use}\n"), &d);
+        assert!(d2.bg_tasks.is_empty(), "只有 <tool-use-id> 的通知也要能清掉：{:?}", d2.bg_tasks);
+    }
+
+    #[test]
+    fn a_stopped_background_command_stops_counting() {
+        // `TaskStop` 实测**不会**再补一条 `<task-notification>`（真机 `bzpg86fdw`）——
+        // 不接这条，被杀掉的任务会永远显示"后台 1"。
+        let start = format!("{}\n{}\n", bg_bash_use("call_b1"), bg_bash_ack("call_b1", "bzpg86fdw"));
+        let d = parse_delta(&start, &Delta::default());
+        assert_eq!(d.bg_tasks.len(), 1, "前置条件");
+
+        // 只发出 `TaskStop`、还没回执 ⇒ 任务仍在（不能提前清）
+        let pending = parse_delta(&format!("{}\n", task_stop_use("call_stop", "bzpg86fdw")), &d);
+        assert_eq!(pending.bg_tasks.len(), 1, "回执没来之前，任务可能还在跑");
+
+        let d2 = parse_delta(&format!("{}\n", task_stop_result("call_stop", true)), &pending);
+        assert!(d2.bg_tasks.is_empty(), "停成功之后必须清掉：{:?}", d2.bg_tasks);
+    }
+
+    #[test]
+    fn a_failed_stop_keeps_the_background_command() {
+        // 结果是 `<tool_use_error>No task found with ID`（真机见过）：**没停成**，
+        // 任务可能还在跑 ⇒ 不能清。同时那张翻译表必须被消费掉，免得越积越多。
+        let start = format!("{}\n{}\n", bg_bash_use("call_b1"), bg_bash_ack("call_b1", "b6h12wle0"));
+        let d = parse_delta(&start, &Delta::default());
+        let d = parse_delta(&format!("{}\n", task_stop_use("call_stop", "b6h12wle0")), &d);
+        let d = parse_delta(&format!("{}\n", task_stop_result("call_stop", false)), &d);
+        assert_eq!(d.bg_tasks.len(), 1, "停失败不能清：{:?}", d.bg_tasks);
+        assert!(d.pending_task_stops.is_empty(), "翻译表要消费掉：{:?}", d.pending_task_stops);
+    }
+
+    #[test]
+    fn a_quoted_background_banner_does_not_create_a_task() {
+        // **反向对照**：`is_async_launch_ack` 那个幽灵代理的同款坑 ——
+        // "Command running in background with ID: …" 会出现在**任何**工具输出里
+        // （读一次源码、grep 一次转录就够）。判据只认**顶层结构字段**
+        // `toolUseResult.backgroundTaskId`，不认正文。
+        let quoted = concat!(
+            r#"{"type":"user","message":{"content":[{"tool_use_id":"call_read","type":"tool_result","content":[{"type":"text","text":"Command running in background with ID: b6h12wle0. Output is being written to: …"}]}]}}"#,
+            "\n",
+        );
+        let d = parse_delta(quoted, &Delta::default());
+        assert!(d.bg_tasks.is_empty(), "只有正文提到、没有结构字段 ⇒ 不能凭空造任务：{:?}", d.bg_tasks);
+    }
+
+    #[test]
+    fn an_escape_interrupt_does_not_forget_running_background_commands() {
+        // 后台任务与 Esc 是**解耦**的：打断结束的是前台回合，后台脚本照常在跑。
+        // （这一点与 `pending_agents` 相反 —— 前台在飞的代理会被打断清掉。）
+        let start = format!("{}\n{}\n", bg_bash_use("call_b1"), bg_bash_ack("call_b1", "b6h12wle0"));
+        let d = parse_delta(&start, &Delta::default());
+        let d2 = parse_delta(
+            &format!("{}\n", r#"{"type":"user","interruptedMessageId":"m1","message":{"content":""}}"#),
+            &d,
+        );
+        assert!(d2.interrupted, "前置条件：打断标记被认出来");
+        assert_eq!(d2.bg_tasks.len(), 1, "Esc 不能把后台命令一起清掉：{:?}", d2.bg_tasks);
+    }
+
     /// `last_line_at` = 这份转录里**最后一条对话行**（`assistant` / `user`）的时间戳
     /// （跨轮保留、取 max）。⚠️ **杂项行（`system` / `attachment` / `file-history-snapshot` /
     /// `last-prompt` / `cost-state` / `queue-operation`）不算** —— 那是 Claude Code 在做家务，
@@ -805,7 +975,7 @@ mod parse_tests {
 }
 
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 子代理是通过 `Agent` 工具调用派发的，所以"哪个工具代表一个子代理"就是这一个名字。
 const AGENT_TOOL: &str = "Agent";
@@ -823,6 +993,10 @@ const AGENT_TOOL: &str = "Agent";
 ///   跑，通知仍记在**当前那一轮**的 id 上），而给**别的 Claude 会话**发消息会带
 ///   `"another Claude session"`。这两类都**不是**本会话多了一个在跑的子代理。
 const SEND_MESSAGE_TOOL: &str = "SendMessage";
+
+/// **停止一个后台任务**的工具。它只带 `task_id`（不是 `tool_use` id），所以要与启动时的
+/// `backgroundTaskId` 对上才清得掉 —— 见 [`Delta::bg_tasks`]。
+const TASK_STOP_TOOL: &str = "TaskStop";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Delta {
@@ -891,6 +1065,35 @@ pub struct Delta {
     /// 打印一次转录"污染 —— 与本文件里 `is_async_launch_ack` 的幽灵代理是同一个坑。
     /// 先记下真调用过的 id，只对它们认内容，幽灵就不可能凭空出现。
     pub send_message_ids: BTreeSet<String>,
+
+    /// **仍在跑的后台命令** —— `Bash` 带 `run_in_background: true` 起的那条脚本/程序。
+    /// 键 = Claude Code 发的 **task id**（如 `b6h12wle0`），值 = 发起它的 `tool_use` id。
+    ///
+    /// 用户 2026-10-30 报："对子代理的信息可以正常探查，但是对会话里后台运行的脚本探查不到，
+    /// 有时候后台在运行程序，但是 HUD 不显示"。子代理有 `Agent`/`tool_result` 配对可数，
+    /// 后台命令的**回执是"已启动"而不是"已完成"**，若按普通工具回执处理，一启动就被当成
+    /// 跑完 —— 与 `bg_agents` 是同一个坑，只是工具不同。
+    ///
+    /// 判据全部取**结构字段**，不取文案：
+    ///
+    /// - **启动**：`user` 行的**顶层** `toolUseResult.backgroundTaskId`（真机 142 例，
+    ///   全部是 `Bash`；`Agent` 的后台启动走的是 `agentId` + `status: async_launched`）。
+    ///   不认 `"Command running in background with ID: …"` 这句文案 —— 它会作为**任何**
+    ///   工具输出出现（读一次源码、grep 一次转录就够），与本仓 `is_async_launch_ack`
+    ///   的幽灵代理是同一个坑。反向对照见
+    ///   `a_quoted_background_banner_does_not_create_a_task`。
+    /// - **完成**：`<task-notification>` 里的 `<task-id>`（真机实测与 `backgroundTaskId`
+    ///   是同一个值）。通知里同时带 `<tool-use-id>`，两条路都认，少一个字段也不会漏清。
+    /// - **被停掉**：`TaskStop` 的**成功**回执。实测**不会**再补发 `<task-notification>`
+    ///   （`bzpg86fdw` 那条止于此）—— 不接这条，界面会把一个已经被杀掉的任务永远显示成
+    ///   "后台 1"。
+    pub bg_tasks: BTreeMap<String, String>,
+
+    /// **尚未收到回执的 `TaskStop` 调用**：`tool_use` id → 被停的 `task_id`。
+    ///
+    /// 只为一件事存在：`TaskStop` 的**入参**里有 `task_id`，而结果只按 `tool_use_id` 配对；
+    /// 不带这张表就没法把"停成功了"翻译成"清掉哪一个后台任务"。
+    pub pending_task_stops: BTreeMap<String, String>,
 
     /// 这份转录里**最后一条带时间戳的行**是什么时候写的（epoch 秒）。
     ///
@@ -1029,13 +1232,17 @@ fn is_notification_carrier(v: &Value) -> Option<&str> {
     s.contains("<task-notification>").then_some(s)
 }
 
-/// 从 `<task-notification>` 正文里取出 `<tool-use-id>`。
-fn task_notification_tool_use_id(text: &str) -> Option<String> {
-    const OPEN: &str = "<tool-use-id>";
-    const CLOSE: &str = "</tool-use-id>";
-    let s = text.find(OPEN)? + OPEN.len();
-    let e = s + text[s..].find(CLOSE)?;
-    Some(text[s..e].to_string())
+/// 取 `<task-notification>` 正文里某个标签的值（`tool-use-id` / `task-id`）。
+///
+/// 只认**成对标签**：后台任务的通知是这套 XML 形态（真机逐字，2026-10-26），
+/// 而 `<task-notification>` 这个字符串本身会出现在任何人的工具输出里 —— 判据必须落在
+/// 通知行上（`is_notification_carrier`），不能"见到就认"。
+fn notification_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let s = text.find(&open)? + open.len();
+    let e = s + text[s..].find(&close)?;
+    Some(&text[s..e])
 }
 
 /// 从工具名和入参里挑一个"一眼能认出在干什么"的短描述。
@@ -1127,13 +1334,19 @@ pub fn parse_delta(text: &str, prior: &Delta) -> Delta {
         // `user` 行上 —— 于是这条判据在真数据上**从未命中过**，`bg_agents` 只增不减）。
         // 教训与本仓另一处同类：**"某段代码在跑"要确认它在生产路径上真的被执行**，
         // 而不是"它写的那个条件看起来对"。
-        if let Some(text) = is_notification_carrier(&v)
-            && let Some(id) = task_notification_tool_use_id(text)
-        {
-            d.bg_agents.remove(&id);
-            // 顺带也从"前台在飞"里去掉：实测前台代理不发这条通知，但万一发了，它同样是终止信号。
-            // 对不在集合里的 id 是空操作。
-            d.pending_agents.remove(&id);
+        if let Some(text) = is_notification_carrier(&v) {
+            if let Some(id) = notification_tag(text, "tool-use-id") {
+                d.bg_agents.remove(id);
+                // 顺带也从"前台在飞"里去掉：实测前台代理不发这条通知，但万一发了，它同样是终止信号。
+                // 对不在集合里的 id 是空操作。
+                d.pending_agents.remove(id);
+                // 后台**命令**也带 `<tool-use-id>`（= 发起它的 Bash 调用的 id）：
+                // 有这条就按值清，不依赖 `<task-id>` 在不在。
+                d.bg_tasks.retain(|_, launch_id| launch_id != id);
+            }
+            if let Some(task_id) = notification_tag(text, "task-id") {
+                d.bg_tasks.remove(task_id);
+            }
         }
 
         match v.get("type").and_then(|t| t.as_str()) {
@@ -1178,6 +1391,18 @@ pub fn parse_delta(text: &str, prior: &Delta) -> Delta {
                             {
                                 d.send_message_ids.insert(id.to_string());
                             }
+                            // 停后台任务：入参带 `task_id`，结果只按 `tool_use_id` 配对，
+                            // 先记下来当翻译表（见 `Delta::pending_task_stops`）。
+                            if name == TASK_STOP_TOOL
+                                && let Some(id) = b.get("id").and_then(|i| i.as_str())
+                                && let Some(task_id) = b
+                                    .get("input")
+                                    .and_then(|i| i.get("task_id"))
+                                    .and_then(|t| t.as_str())
+                            {
+                                d.pending_task_stops
+                                    .insert(id.to_string(), task_id.to_string());
+                            }
                             d.last_tool = Some(name.to_string());
                             let input = b.get("input").cloned().unwrap_or(Value::Null);
                             d.last_tool_detail = summarize_tool(name, &input);
@@ -1213,6 +1438,29 @@ pub fn parse_delta(text: &str, prior: &Delta) -> Delta {
                         continue;
                     };
                     let is_send_message = d.send_message_ids.remove(id);
+
+                    // **后台命令启动了**：`Bash` 的 `run_in_background` 回执带的是
+                    // "已启动"，不是"已完成" —— 按普通回执处理会当场当成跑完。
+                    // 判据取顶层结构字段 `toolUseResult.backgroundTaskId`（真机 142 例全是
+                    // `Bash`），不认回执正文里那句 "Command running in background with ID"。
+                    if let Some(task_id) = v
+                        .get("toolUseResult")
+                        .and_then(|t| t.get("backgroundTaskId"))
+                        .and_then(|t| t.as_str())
+                    {
+                        d.bg_tasks.insert(task_id.to_string(), id.to_string());
+                    }
+
+                    // **`TaskStop` 的回执**：成功即任务已不在跑。实测被杀掉的任务**不会**
+                    // 再补一条 `<task-notification>`，所以这里不清就会永远显示"后台 1"。
+                    // 无论成败都要把这张翻译表消费掉，免得失败的那些越积越多。
+                    if let Some(task_id) = d.pending_task_stops.remove(id) {
+                        let failed = b.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+                        if !failed {
+                            d.bg_tasks.remove(&task_id);
+                        }
+                    }
+
                     if is_async_launch_ack(b) {
                         // 后台代理：这一条是**启动回执**，从"在飞"挪到"后台在跑"。
                         //

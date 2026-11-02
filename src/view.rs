@@ -53,6 +53,15 @@ pub struct Row {
     /// 与 `Delta::bg_agents`）。
     /// **没有子代理时恒为 0**，界面据此**不画**这一段（而不是画一个 0）。
     pub subagent_count: u32,
+    /// **在跑的后台命令个数**（`Bash` 的 `run_in_background`，2026-10-30 新增）。
+    ///
+    /// 口径 = 主 transcript 里已收到"已启动"回执、还没等到完成通知（或被 `TaskStop`
+    /// 停掉）的后台任务数，推导见 `transcript::Delta::bg_tasks`。
+    ///
+    /// 与 `subagent_count` **分开记**：两者的完成信号不同，界面上也要分得开
+    /// （"子代理 N" / "后台 N"）。状态覆盖一视同仁（见 `build_rows_with_deltas`）。
+    /// **没有后台任务时恒为 0**，界面据此不画这一段。
+    pub bg_task_count: u32,
     /// **宿主 Claude Code 进程已经不在了**（9b 的僵尸会话）。
     ///
     /// 由 `ui` 判存活后经 [`mark_host_gone`] 置位 —— **不在本模块里算**，因为判存活要调
@@ -157,7 +166,14 @@ pub fn build_rows_with_deltas(
             let subagent_count = delta.map_or(0, |d| {
                 (d.pending_agents.len() + d.bg_agents.len()) as u32
             });
-            let state = if subagent_count > 0 && matches!(state, State::Done | State::Idle) {
+            // 后台**命令**（`run_in_background` 的 Bash）同理：主代理 `Stop` 之后脚本还在跑，
+            // 界面不能写"完成/待命"（用户 2026-10-30 报的"后台在运行程序，但是 HUD 不显示"）。
+            // 与子代理共用同一条覆盖、同样只压 `Done` / `Idle` —— `Waiting`（等你确认）/
+            // `Error` / `Interrupted` 更需要你动手，不能被这里降级藏掉。
+            let bg_task_count = delta.map_or(0, |d| d.bg_tasks.len() as u32);
+            let state = if (subagent_count + bg_task_count) > 0
+                && matches!(state, State::Done | State::Idle)
+            {
                 State::Working
             } else {
                 state
@@ -299,6 +315,7 @@ pub fn build_rows_with_deltas(
                     progress,
                     subtitle,
                     subagent_count,
+                    bg_task_count,
                     // `mark_host_gone` 之后才置位（它要 syscall，本模块保持纯函数）。
                     host_gone: false,
                 },
@@ -549,6 +566,40 @@ mod wire_tests {
             100,
         );
         assert_eq!(rows[0].state, State::Done, "没有子代理时该是什么就是什么");
+    }
+
+    #[test]
+    fn a_running_background_command_keeps_a_stopped_session_showing_as_working() {
+        // 用户 2026-10-30 报："有时候后台在运行程序，但是 HUD 不显示" —— 主代理 `Stop`
+        // 之后 `Bash run_in_background` 起的脚本还在跑，界面不能写"完成/待命"。
+        let cfg = Config::default();
+        let mut stopped = st("a");
+        stopped.state = "done".into();
+        stopped.state_since = 100;
+        let bg = Delta {
+            bg_tasks: [("b6h12wle0".to_string(), "call_b1".to_string())].into(),
+            ..Default::default()
+        };
+        let rows = build_rows_with_deltas(
+            &[stopped.clone()],
+            &HashMap::from([("a".to_string(), bg.clone())]),
+            &cfg,
+            100,
+        );
+        assert_eq!(rows[0].state, State::Working, "后台命令在跑时不能显示完成");
+        assert_eq!(rows[0].bg_task_count, 1);
+        assert_eq!(rows[0].subagent_count, 0, "后台命令不是子代理，两个计数不能混");
+
+        // `Waiting`（等你确认）不能被降级 —— 与子代理那条覆盖同一口径。
+        let mut waiting = stopped.clone();
+        waiting.state = "waiting".into();
+        let rows = build_rows_with_deltas(
+            &[waiting],
+            &HashMap::from([("a".to_string(), bg)]),
+            &cfg,
+            100,
+        );
+        assert_eq!(rows[0].state, State::Waiting, "等你确认不能被后台命令降级成工作中");
     }
 
     #[test]

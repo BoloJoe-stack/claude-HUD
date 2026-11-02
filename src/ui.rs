@@ -1499,6 +1499,19 @@ fn fmt_subagents(n: u32) -> String {
     format!("子代理 {}", n)
 }
 
+/// 后台命令那一段的文字（`Bash` 的 `run_in_background`，2026-10-30）。同样**只在 n > 0
+/// 时被调用** —— 没有在跑的后台程序就整段不画。
+fn fmt_background(n: u32) -> String {
+    format!("后台 {}", n)
+}
+
+/// 子代理与后台命令**同时在跑**时的那一段。
+///
+/// 两样都要说，且不能说成"任务 N"：用户要的是分清"这是子代理在干"还是"这是后台脚本在跑"。
+fn fmt_agents_and_background(agents: u32, bg: u32) -> String {
+    format!("子代理 {} 后台 {}", agents, bg)
+}
+
 /// 会名截断用的省略号（U+2026）。**数码子集里没有这个字形**（它只有 `0-9` `:`），
 /// 由中文/拉丁兜底字体提供 —— 与中文走同一条逐字符回退，见 `text_width` 的注释。
 const ELLIPSIS: &str = "…";
@@ -1766,11 +1779,46 @@ fn row_name(ui: &egui::Ui, row: &view::Row) -> String {
     })
 }
 
+/// 第二行**右段**那一截文字：在跑的子代理 / 在跑的后台命令 / 两者都有。
+/// `(0, 0)` ⇒ `None`（整段不画 —— 不画 `子代理 0`、也不画 `后台 0`）。
+///
+/// ⚠️ **两者都在跑时按宽度退让**（2026-10-30）。第二行左段是
+/// `上下文 N%` + 今日 token，右段贴右缘；最窄窗（`MIN_INNER_WIDTH`）+ 最坏左段
+/// （`上下文 100%` + `165.0M`）下，右段只有约 **64pt** 可用，而
+/// `子代理 1 后台 1` 实测 **84.59pt**（11.25pt 字号）—— 并排画会**压到 token 上**。
+///
+/// 退让顺序：先试完整文案，放不下就**只留后台**。理由是这两条信息的"新旧"：
+/// 子代理 N 从 2026-09-15 起一直有，而后台命令正是用户 2026-10-30 报"看不见"的那一半；
+/// 且窄窗是用户主动拖到的边缘情形，默认 320pt 下两段都画得下（实测 84.59 < 168）。
+/// 这条余量由 `the_running_label_never_runs_into_the_token_number` 守着。
+fn running_label(ui: &egui::Ui, row: &view::Row) -> Option<String> {
+    match (row.subagent_count, row.bg_task_count) {
+        (0, 0) => None,
+        (agents, 0) => Some(fmt_subagents(agents)),
+        (0, bg) => Some(fmt_background(bg)),
+        (agents, bg) => {
+            let both = fmt_agents_and_background(agents, bg);
+            // 左段已经画完，`min_rect().right()` 就是它的右缘；再让出一个
+            // `item_spacing.x` 的间隙 —— `paint_right` 是**直接画**的，不经过布局，
+            // 不会自动留这条缝（与 `paint_right` 返回值里那句 `+ item_spacing.x` 同一个约定）。
+            let room = ui.max_rect().right()
+                - ui.min_rect().right()
+                - ui.spacing().item_spacing.x;
+            if text_width_in(ui, &both, CONTEXT_SIZE, egui::FontFamily::Proportional) <= room {
+                Some(both)
+            } else {
+                Some(fmt_background(bg))
+            }
+        }
+    }
+}
+
+
 /// 画一行，**两行文字**（两行各有一条**右缘基准**，用户 2026-09-15 第三轮裁定）：
 ///
 /// ```text
 /// ▍ 会名（17pt 加粗黑，过长截断加 …）        工作中   02:13   ← 右组贴右缘
-/// 上下文 68%  3.2M                    子代理 2                ← 11.25pt；子代理只在 >0 时画
+/// 上下文 68%  3.2M                    子代理 2                ← 11.25pt；子代理 / 后台只在 >0 时画
 /// ─────────────────────────────────────────
 ///                    ↑ 第二行离上面那行 14pt、离下面那条线 8pt（上大下小 = 第二行属于上面那行）
 /// ```
@@ -1912,11 +1960,11 @@ fn draw_row(ui: &mut egui::Ui, row: &view::Row, ledger: &usage::LedgerView, bar_
                 .size(TOKENS_SIZE)
                 .color(TOKENS_COLOR),
         );
-        if row.subagent_count > 0 {
+        if let Some(label) = running_label(ui, row) {
             sub_rect = Some(
                 paint_right(
                     ui,
-                    fmt_subagents(row.subagent_count),
+                    label,
                     CONTEXT_SIZE,
                     TEXT_COLOR,
                     ctx_top,
@@ -4103,6 +4151,7 @@ mod tests {
             progress: Progress::Steps(12),
             subtitle: Some("已修复排版，共 12 处".into()),
             subagent_count: 0,
+            bg_task_count: 0,
             host_gone: false,
         }
     }
@@ -5848,6 +5897,91 @@ mod tests {
         }
     }
 
+    // ---- 后台命令（`Bash` 的 `run_in_background`，2026-10-30）-------------------
+    //
+    // 用户原话："对子代理的信息可以正常探查，但是对会话里后台运行的脚本探查不到，
+    // 有时候后台在运行程序，但是 HUD 不显示，这种情况下要显示后台程序运行中"。
+    // 数据判据见 `transcript::Delta::bg_tasks`；这里只钉**画出来的字**。
+
+    #[test]
+    fn a_background_command_is_shown_on_the_context_line() {
+        let mut r = row("会话甲", State::Working, 72);
+        r.bg_task_count = 1;
+        let texts = painted_texts(&run_frame(&[r]));
+        assert!(texts.contains("后台 1"), "后台命令必须在第二行右段画出来：{texts}");
+        assert!(!texts.contains("子代理"), "没有子代理时不该画子代理：{texts}");
+
+        // 反向对照：没有后台任务时**不许**出现 `后台 0` —— 恒为 0 的计数是噪音，
+        // 也会让"有没有后台任务"这个扫视判断失效。
+        let plain = painted_texts(&run_frame(&[row("会话甲", State::Working, 72)]));
+        assert!(!plain.contains("后台"), "没有后台任务时整段不画：{plain}");
+    }
+
+    #[test]
+    fn when_both_run_the_row_says_so() {
+        let mut r = row("会话甲", State::Working, 72);
+        r.subagent_count = 2;
+        r.bg_task_count = 1;
+        let texts = painted_texts(&run_frame(&[r]));
+        assert!(
+            texts.contains("子代理 2 后台 1"),
+            "两样同时在跑时必须分得开（不能合成一个「任务 3」）：{texts}"
+        );
+    }
+
+    #[test]
+    fn the_running_label_never_runs_into_the_token_number() {
+        // 最窄窗（`MIN_INNER_WIDTH`）+ 最坏左段（`上下文 100%` + `165.0M`）：
+        // `子代理 1 后台 1` 实测 84.59pt，而右段只有约 64pt ⇒ 必须退让成**只画后台**，
+        // 而不是压在 token 数上（那会让两段字糊成一团）。
+        let mut r = row("会话甲", State::Working, 3599);
+        r.session_id = "sess-a".into();
+        r.subagent_count = 12;
+        r.bg_task_count = 3;
+        r.context_pct = Some(1.0);
+        let ledger = ledger_with("sess-a", 165_000_000);
+        let cfg = config::Config::default();
+
+        let shapes = run_frame_sized_with_ledger(&[r.clone()], MIN_INNER_WIDTH, 400.0, &ledger.view(), &cfg);
+        let rects = drawn_rects(&shapes);
+        let rect_of = |n: &str| {
+            rects
+                .iter()
+                .find(|(t, _)| t == n)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("最窄窗没画出 {n:?}"))
+        };
+        let (tok, bg) = (rect_of("165.0M"), rect_of("后台 3"));
+        assert!(
+            tok.right() <= bg.left(),
+            "最窄窗：token 数右缘 {} 撞上了后台计数左缘 {}",
+            tok.right(),
+            bg.left()
+        );
+        assert!(
+            !painted_texts(&shapes).contains("子代理 12 后台 3"),
+            "放不下时完整的组合文案不该出现"
+        );
+
+        // 默认 320pt 下两段都放得下 ⇒ 完整文案照常出现（退让只在真的挤的时候发生）。
+        let shapes = run_frame_sized_with_ledger(&[r], 320.0, 400.0, &ledger.view(), &cfg);
+        let rects = drawn_rects(&shapes);
+        let rect_of = |n: &str| {
+            rects
+                .iter()
+                .find(|(t, _)| t == n)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("320pt 没画出 {n:?}"))
+        };
+        let (tok, both) = (rect_of("165.0M"), rect_of("子代理 12 后台 3"));
+        assert!(
+            tok.right() <= both.left(),
+            "320pt：token 数右缘 {} 撞上了组合文案左缘 {}",
+            tok.right(),
+            both.left()
+        );
+    }
+
     /// 一帧里"每一行的色条颜色"，按行配对：`(行里画出的会名, 色条的 RGB)`。
     ///
     /// 色条与会名在同一行、y 相同，所以按 y 配对 —— 这样测试不必假设行的顺序
@@ -6456,3 +6590,4 @@ mod tests {
         assert_eq!(fmt_elapsed(360_000_000), "100000:00");
     }
 }
+
