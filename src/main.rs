@@ -118,6 +118,20 @@ fn main() {
             }
             std::process::exit(0);
         }
+        Some("--version") | Some("-V") => {
+            // 版本号必须同时满足两种拿法：脚本里能读走（stdout），双击 / Win+R 时也能看见
+            // （对话框）。GUI 子系统进程在没有控制台时 stdout 是无效句柄，`writeln!` 返回
+            // Err —— 用这一次写失败来区分两种情形，不必额外查 `GetConsoleWindow`。
+            let line = format!("claude-hud {}", env!("CARGO_PKG_VERSION"));
+            let printed = {
+                use std::io::Write as _;
+                let mut out = std::io::stdout();
+                writeln!(out, "{line}").is_ok() && out.flush().is_ok()
+            };
+            if !printed {
+                show_message("claude-hud", &line, false);
+            }
+        }
         Some("--doctor") => {
 
             // 自检：拿真机数据核一遍那些"靠约定/措辞/路径"的判据还成不成立。

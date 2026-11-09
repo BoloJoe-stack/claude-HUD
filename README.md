@@ -13,7 +13,7 @@ Windows 桌面常驻小挂件：一眼看清**多个并发 Claude Code 会话**�
    （只新增 `hooks` 键，你原有的 `env` 等配置一字不动；重复执行不会翻倍）
 3. 双击 `claude-hud.exe` 起挂件
 
-卸载 `claude-hud.exe --uninstall-hooks` · 自检 `claude-hud.exe --doctor`
+卸载 `claude-hud.exe --uninstall-hooks` · 自检 `claude-hud.exe --doctor` · 版本 `claude-hud.exe --version`
 
 ⚠️ `--install-hooks` 会改写**全局** settings，影响所有 Claude Code 会话，执行前建议先备份。
 ⚠️ hook 记的是 exe 的**绝对路径** —— 挪动 exe 之后要重新 `--install-hooks`。
