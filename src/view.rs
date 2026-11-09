@@ -38,7 +38,8 @@ pub struct Row {
     /// **不渲染**（保留待 M4）：上下文 token 数。解析照旧。
     pub context_tokens: Option<u64>,
     /// **不渲染**（保留待 M4）：上下文上限（来自 `Config::context_limit`）。
-    pub context_limit: u64,
+    /// `None` = 用户还没配置 —— 此时 `context_pct` 也必须是 `None`，不编造百分比。
+    pub context_limit: Option<u64>,
     /// **渲染中**（第二轮加回，用户要求"显示上下文占比"）：上下文占比 = tokens / limit。
     pub context_pct: Option<f32>,
     /// **不渲染**（保留待 M4）：步数 / 任务进度。解析照旧。
@@ -277,8 +278,12 @@ pub fn build_rows_with_deltas(
             // `transcript::Delta` 提供（`poller::refresh` 每轮把 transcript 增量折叠进去）。
             // 没有 delta（会话无 transcript 路径、或文件还没读到）时留空。
             let context_tokens = delta.and_then(|d| d.context_tokens);
-            let context_pct = context_tokens
-                .map(|t| (t as f64 / cfg.context_limit.max(1) as f64) as f32);
+            // 上限没配置（`None`）时**不算百分比**：0 或 1M 都是编出来的数，
+            // 而"看起来合理但错 5 倍"正是本项目点名的危险失效。界面会显示 `上下文 --`。
+            let context_pct = match (context_tokens, cfg.context_limit) {
+                (Some(t), Some(limit)) if limit > 0 => Some((t as f64 / limit as f64) as f32),
+                _ => None,
+            };
 
             // spec §2 的"智能回退"：有任务清单时本应显示 n/N，但 spec §4.2 实测
             // TodoWrite / Task 各 0 次，且 §6 的事件集不含 TaskCreated/TaskCompleted，
@@ -826,7 +831,8 @@ mod wire_tests {
 
     #[test]
     fn delta_supplies_detail_progress_and_context_pct() {
-        let cfg = Config::default(); // limit = 1_000_000
+        let mut cfg = Config::default();
+        cfg.context_limit = Some(1_000_000);
         let mut deltas = HashMap::new();
         deltas.insert(
             "a".to_string(),
@@ -851,6 +857,22 @@ mod wire_tests {
         assert!((r.context_pct.unwrap() - 0.363026).abs() < 1e-6);
         assert_eq!(r.progress, Progress::Steps(12));
         assert_eq!(r.subagent_count, 2, "两个未配对的 Agent 调用 = 两个在跑的子代理");
+    }
+
+    #[test]
+    fn an_unset_context_limit_yields_no_percentage() {
+        // 用户跳过首次运行的询问（或手删了配置里的 context_limit）时，
+        // 百分比必须是"没有"，而不是按某个默认值算出来的数 —— 后者看起来合理但会错数倍。
+        let cfg = Config::default();
+        assert_eq!(cfg.context_limit, None);
+        let mut deltas = HashMap::new();
+        deltas.insert(
+            "a".to_string(),
+            Delta { context_tokens: Some(363_026), ..Default::default() },
+        );
+        let rows = build_rows_with_deltas(&[st("a")], &deltas, &cfg, 100);
+        assert_eq!(rows[0].context_tokens, Some(363_026), "token 数照常给");
+        assert!(rows[0].context_pct.is_none(), "上限未知时不得编造百分比");
     }
 
     #[test]

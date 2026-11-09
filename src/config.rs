@@ -4,8 +4,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// spec §4.3：必须手配。transcript 里没有任何窗口字段可推断。
-    pub context_limit: u64,
+    /// 上下文上限（用于算「上下文 N%」）。
+    ///
+    /// **`None` = 还没配置**，不是 0，也不是 1M：transcript 里没有任何窗口字段可推断，
+    /// 乱猜会静默算错数倍（spec §4.3）。首次运行会弹一次询问；用户跳过时保持 `None`，
+    /// 界面显示 `上下文 --` + token 数，**不编造百分比**。
+    pub context_limit: Option<u64>,
+    /// 首次运行是否已经问过「要不要注册 hook」。用户点「否」之后不再每次启动都弹。
+    pub hooks_prompted: bool,
+    /// 首次运行是否已经问过上下文上限（跳过也算问过）。
+    pub context_prompted: bool,
     /// 上下文占比达到此值即转琥珀色。**有真实读者**：`ui.rs` 里给"上下文 N%"着色的那处。
     ///
     /// （更正，2026-09-14：本字段上方原先写着"界面侧已无读者、保留待 M4" —— 那是界面改造
@@ -42,7 +50,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            context_limit: 1_000_000,
+            context_limit: None,
+            hooks_prompted: false,
+            context_prompted: false,
             warn_threshold: 50,
             danger_threshold: 75,
             poll_interval_ms: 1000,
@@ -155,9 +165,12 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn default_context_limit_is_one_million() {
-        // spec §4.3：上限必须手配，默认 1M，绝不推断
-        assert_eq!(Config::default().context_limit, 1_000_000);
+    fn default_context_limit_is_unset_not_a_guess() {
+        // spec §4.3：上限无法从文件推断，**默认不猜**。首次运行会问一次；
+        // 用户跳过时界面显示 `上下文 --` + token 数，而不是按 1M 算出一个假百分比。
+        assert_eq!(Config::default().context_limit, None);
+        assert!(!Config::default().hooks_prompted);
+        assert!(!Config::default().context_prompted);
     }
 
     #[test]
@@ -173,7 +186,7 @@ mod tests {
         let dir = tempdir();
         let missing = dir.join("nope.json");
         assert!(report_broken(&missing).is_none(), "文件不存在不是故障，不该报警");
-        assert_eq!(load_from(&missing).context_limit, 1_000_000);
+        assert_eq!(load_from(&missing).context_limit, None);
 
         let broken = dir.join("config.json");
         fs::write(&broken, br#"{"context_limit": 128000, "poll_interval_ms":"#).unwrap();
@@ -190,14 +203,14 @@ mod tests {
         // 正常文件不报
         fs::write(&broken, r#"{"context_limit": 128000}"#).unwrap();
         assert!(report_broken(&broken).is_none());
-        assert_eq!(load_from(&broken).context_limit, 128_000);
+        assert_eq!(load_from(&broken).context_limit, Some(128_000));
     }
 
     #[test]
     fn missing_file_yields_defaults() {
         let dir = tempdir();
         let p = dir.join("nope.json");
-        assert_eq!(load_from(&p).context_limit, 1_000_000);
+        assert_eq!(load_from(&p).context_limit, None);
     }
 
     #[test]
@@ -206,7 +219,7 @@ mod tests {
         let p = dir.join("config.json");
         fs::write(&p, r#"{"context_limit": 128000}"#).unwrap();
         let c = load_from(&p);
-        assert_eq!(c.context_limit, 128_000);   // 被覆盖
+        assert_eq!(c.context_limit, Some(128_000));   // 被覆盖
         assert_eq!(c.idle_after_sec, 300);      // 保持默认
         assert_eq!(c.warn_threshold, 50);
     }
@@ -229,7 +242,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             load_from(&p).context_limit,
-            128_000,
+            Some(128_000),
             "旧文件里多出的键不得让整份配置解析失败"
         );
         assert_eq!(load_from(&p).idle_after_sec, 300, "其余字段照常取默认值");
@@ -254,7 +267,7 @@ mod tests {
         fs::write(&p, r#"{"context_limit":128000,"opacity":0.92,"always_on_top":false}"#).unwrap();
 
         let c = load_from(&p);
-        assert_eq!(c.context_limit, 128_000, "被删掉的 opacity 不得拖垮整份配置");
+        assert_eq!(c.context_limit, Some(128_000), "被删掉的 opacity 不得拖垮整份配置");
         assert!(!c.always_on_top, "同一个文件里的其它键必须照常生效");
         assert!(
             report_broken(&p).is_none(),
@@ -267,7 +280,7 @@ mod tests {
             "存回去的 JSON 里不得再有 opacity：{}",
             fs::read_to_string(&p).unwrap()
         );
-        assert_eq!(load_from(&p).context_limit, 128_000, "存回去之后仍要能读回同一个值");
+        assert_eq!(load_from(&p).context_limit, Some(128_000), "存回去之后仍要能读回同一个值");
     }
 
     #[test]
@@ -295,18 +308,18 @@ mod tests {
         fs::write(&stale_tmp, r#"{"context_limit": 1}"#).unwrap();
 
         let mut c = Config::default();
-        c.context_limit = 128_000;
+        c.context_limit = Some(128_000);
         c.poll_interval_ms = 250;
         c.window_pos = [42.0, 99.0];
         save_to(&p, &c).unwrap();
 
         // (a) 往返读回的值正确（原子写的另一半：目标文件必须是完整 JSON）
         let back = load_from(&p);
-        assert_eq!(back.context_limit, 128_000);
+        assert_eq!(back.context_limit, Some(128_000));
         assert_eq!(back.poll_interval_ms, 250);
         assert_eq!(back.window_pos, [42.0, 99.0]);
         // 目标文件不得等同于遗留 tmp 的内容（防止"复用了别人的半成品"）
-        assert_ne!(back.context_limit, 1);
+        assert_ne!(back.context_limit, Some(1));
 
         // (b) 除预置的陈旧文件外不残留任何 .tmp —— 唯一名实现不复用固定名 tmp，
         //     残留只可能来自预置，绝不可能来自 save_to 自己
@@ -337,7 +350,7 @@ mod tests {
         let dir = tempdir();
         let p = dir.join("config.json");
         let mut good = Config::default();
-        good.context_limit = 128_000;
+        good.context_limit = Some(128_000);
         good.poll_interval_ms = 250;
         save_to(&p, &good).unwrap();
         let before = fs::read_to_string(&p).unwrap();
@@ -347,7 +360,7 @@ mod tests {
         fs::set_permissions(&p, perms).unwrap();
 
         let mut other = Config::default();
-        other.context_limit = 42;
+        other.context_limit = Some(42);
         let res = save_to(&p, &other);
 
         // 先复位只读位再断言，避免 tempdir 下一轮的 remove_dir_all 被挡住
@@ -364,9 +377,9 @@ mod tests {
         );
         // ② 读回来仍是用户手配的值，而不是新值、也不是默认值
         let back = load_from(&p);
-        assert_eq!(back.context_limit, 128_000, "既有配置必须仍然可读且原样");
+        assert_eq!(back.context_limit, Some(128_000), "既有配置必须仍然可读且原样");
         assert_eq!(back.poll_interval_ms, 250);
-        assert_ne!(back.context_limit, 42, "失败的那次写入不得部分生效");
+        assert_ne!(back.context_limit, Some(42), "失败的那次写入不得部分生效");
         // ③ 不残留自己的 tmp（唯一名 tmp 不会被下一次写覆盖而自愈）
         // 局限：只读目标让 `write` 阶段就无法通过，所以本用例区分不了"先截断再失败"
         // 的实现；它钉的是同一条契约的另一半 —— 提交点失败时目标必须完好。

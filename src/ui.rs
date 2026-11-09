@@ -4146,7 +4146,7 @@ mod tests {
             // `context_pct` 从第二轮起**要**显示，所以它不再是"不该出现"的一员。
             detail: Some("Bash · cargo test".into()),
             context_tokens: Some(363_026),
-            context_limit: 1_000_000,
+            context_limit: Some(1_000_000),
             context_pct: Some(0.36),
             progress: Progress::Steps(12),
             subtitle: Some("已修复排版，共 12 处".into()),
@@ -4770,7 +4770,8 @@ mod tests {
         let sessions = tempdir("wire-sessions");
         state_file(&sessions, "s1", &t);
 
-        let cfg = config::Config::default();
+        let mut cfg = config::Config::default();
+        cfg.context_limit = Some(1_000_000);
         let rows = poll_once(
             &sessions,
             &mut HashMap::new(),

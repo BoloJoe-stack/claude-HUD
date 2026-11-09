@@ -46,6 +46,25 @@ fn is_our_group(grp: &Value, exe: &Path) -> bool {
         })
 }
 
+/// 8 个事件是否都指向**这个 exe**。首次启动据此决定要不要弹「注册 hook」。
+///
+/// 读不出来（文件不存在 / 非法 JSON）一律算"没装" —— 调用方会去问用户，
+/// 而安装本身对坏文件是**报错退出**，不会覆盖它（见 [`load`]）。
+pub fn is_installed(settings_path: &Path, exe: &Path) -> bool {
+    let Ok(root) = load(settings_path) else {
+        return false;
+    };
+    let Some(hooks) = root.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    EVENTS.iter().all(|event| {
+        hooks
+            .get(*event)
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().any(|g| is_our_group(g, exe)))
+    })
+}
+
 /// 临时文件名对每次调用唯一：把 pid 与线程 id 拼进目标文件名末尾（沿用 state.rs / config.rs
 /// 已落地的同一手法）。固定名（`settings.json.tmp`）会让两个并发写者共用同一个 tmp ——
 /// B 可能在 A 的 `write` 与 `rename` 之间截断该文件，A 随即把截断的 tmp rename 到位，
@@ -402,6 +421,41 @@ mod tests {
             "uninstall 失败路径不得改动文件一个字节"
         );
         assert!(res.is_err(), "uninstall 对读不出来的文件必须 Err");
+    }
+
+    // ── 首次启动的自动注册：先要能判断"装没装过" ──
+
+    #[test]
+    fn is_installed_is_true_right_after_install_and_false_for_another_exe() {
+        let d = tempdir("installed");
+        let p = d.join("settings.json");
+        assert!(!is_installed(&p, &exe()), "文件不存在时必须算没装");
+        install(&p, &exe()).unwrap();
+        assert!(is_installed(&p, &exe()));
+        assert!(
+            !is_installed(&p, &PathBuf::from("C:\\tools\\other-hud.exe")),
+            "换一个 exe 路径就应当算没装 —— hook 记的是绝对路径"
+        );
+    }
+
+    #[test]
+    fn is_installed_requires_all_eight_events() {
+        let d = tempdir("partial");
+        let p = d.join("settings.json");
+        install(&p, &exe()).unwrap();
+        // 人为删掉一个事件：缺一个就算没装（自动注册会把缺的补齐，且不重复）
+        let mut v = read(&p);
+        v["hooks"].as_object_mut().unwrap().remove("Stop");
+        std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        assert!(!is_installed(&p, &exe()), "8 个事件缺一不可");
+    }
+
+    #[test]
+    fn is_installed_is_false_for_a_corrupt_settings_file() {
+        let d = tempdir("corruptcheck");
+        let p = d.join("settings.json");
+        std::fs::write(&p, r#"{"hooks": {"Stop": ["#).unwrap();
+        assert!(!is_installed(&p, &exe()), "读不出来时不能假装已安装");
     }
 
     #[test]

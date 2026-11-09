@@ -26,6 +26,19 @@ unsafe extern "system" {
 
 const MB_ICONINFORMATION: u32 = 0x40;
 const MB_ICONERROR: u32 = 0x10;
+const MB_ICONQUESTION: u32 = 0x20;
+const MB_YESNO: u32 = 0x4;
+const MB_YESNOCANCEL: u32 = 0x3;
+const IDYES: i32 = 6;
+const IDNO: i32 = 7;
+
+/// 三态回答（`MB_YESNOCANCEL`）。「取消」包含用户直接关掉对话框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Yes,
+    No,
+    Cancel,
+}
 
 /// 模态阻塞，直到用户点「确定」为止（`MB_OK` = 0x0）。
 /// `is_error` 决定图标为 ERROR 还是 INFORMATION，便于一眼分辨成败。
@@ -37,4 +50,36 @@ pub fn show_message(title: &str, body: &str, is_error: bool) {
     let (t, b) = (wide(title), wide(body));
     let icon = if is_error { MB_ICONERROR } else { MB_ICONINFORMATION };
     unsafe { MessageBoxW(std::ptr::null_mut(), b.as_ptr(), t.as_ptr(), icon) };
+}
+
+/// 首次运行的一次性询问：是 / 否。
+///
+/// 为什么不用 `show_message` 加一句「请运行 --install-hooks」：那等于把零配置又退回
+/// 手动步骤。这里的两个问题（注册 hook、上下文上限）都只需要点一次，之后写进配置，
+/// 不会再问。
+pub fn ask_yes_no(title: &str, body: &str) -> bool {
+    ask3(title, body, MB_YESNO) == Answer::Yes
+}
+
+/// 三选一：是 / 否 / 取消。取消用于「以后再说」这类**需要记住已回答过**的问题。
+pub fn ask_yes_no_cancel(title: &str, body: &str) -> Answer {
+    ask3(title, body, MB_YESNOCANCEL)
+}
+
+fn ask3(title: &str, body: &str, buttons: u32) -> Answer {
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let (t, b) = (wide(title), wide(body));
+    let id = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            b.as_ptr(),
+            t.as_ptr(),
+            buttons | MB_ICONQUESTION,
+        )
+    };
+    match id {
+        IDYES => Answer::Yes,
+        IDNO => Answer::No,
+        _ => Answer::Cancel,
+    }
 }

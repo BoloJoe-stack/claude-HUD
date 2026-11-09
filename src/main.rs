@@ -199,6 +199,11 @@ fn main() {
             if let Some(warn) = config::report_broken(&paths::real_config_path()) {
                 show_message("claude-hud · 配置未被读取", &warn, true);
             }
+
+            // 首次运行的两次一次性询问（注册 hook、上下文上限）。都写进 config，
+            // 之后不再问；用户点「否 / 取消」也各只问一次。
+            first_run_setup();
+
             if let Err(e) = ui::run() {
                 // 与 --install-hooks 的失败路径同理：GUI 子系统下没有控制台，
                 // `eprintln!` 写进虚空 —— 挂件启动失败时用户会以为"什么都没发生"。
@@ -211,6 +216,78 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+// ---- 首次运行 ------------------------------------------------------------------
+
+/// 首次启动时把「下载完还要手动做的两件事」问掉：注册 hook、上下文上限。
+///
+/// 为什么放在 GUI 启动路径而不是做成命令：目标就是"双击就能用"—— 让用户先去读
+/// README 再回来敲一条命令，等于没做到。两次询问都只需要点一次，答案写进
+/// `%APPDATA%\claude-hud\config.json`，之后不再出现。
+///
+/// 边界：
+/// - **`--hook` / `--doctor` / `--install-hooks` 绝不走这里** —— 它们不经过默认分支；
+///   hook 路径尤其必须保持静默、不弹任何框。
+/// - 用户点「否 / 取消」也算问过（`hooks_prompted` / `context_prompted`），
+///   不会每次启动都骚扰。
+/// - 写配置失败不打扰用户：标志没落盘，下一次启动会再问一次（自愈）。
+fn first_run_setup() {
+    let config_path = paths::real_config_path();
+    let mut cfg = config::load_from(&config_path);
+    let mut dirty = false;
+
+    // A. 注册 hook（挂件能看到会话的前提）
+    if let Ok(exe) = std::env::current_exe() {
+        let settings = hooks_install::default_settings_path();
+        if !hooks_install::is_installed(&settings, &exe) && !cfg.hooks_prompted {
+            cfg.hooks_prompted = true;
+            dirty = true;
+            let yes = dialog::ask_yes_no(
+                "claude-hud · 首次运行",
+                &format!(
+                    "要让挂件看到 Claude Code 的会话，需要注册 8 个 hook。\n\n\
+                     将向下面这个全局配置文件新增 hooks 键，不改动你已有的设置：\n\
+                     {}\n\n\
+                     注意：注册后，已经开着的 Claude Code 会话需要重开一次才会出现。\n\n\
+                     现在注册吗？（以后也可以运行 claude-hud.exe --install-hooks）",
+                    settings.display()
+                ),
+            );
+            if yes {
+                if let Err(e) = hooks_install::install(&settings, &exe) {
+                    show_message(
+                        "claude-hud · 注册失败",
+                        &format!("{}\n\n文件：{}", e, settings.display()),
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    // C. 上下文上限（不配就只显示 token 数，绝不编造百分比）
+    if cfg.context_limit.is_none() && !cfg.context_prompted {
+        cfg.context_prompted = true;
+        dirty = true;
+        match dialog::ask_yes_no_cancel(
+            "claude-hud · 上下文上限",
+            "首次运行：请确认模型的上下文上限，用于显示「上下文 N%」。\n\n\
+             是   = 1,000,000（1M 上下文的模型）\n\
+             否   = 200,000（常见的 200K 模型）\n\
+             取消 = 暂不设置（界面显示「上下文 --」，旁边仍显示 token 数）\n\n\
+             以后可在 %APPDATA%\\claude-hud\\config.json 的 context_limit 修改。",
+        ) {
+            dialog::Answer::Yes => cfg.context_limit = Some(1_000_000),
+            dialog::Answer::No => cfg.context_limit = Some(200_000),
+            dialog::Answer::Cancel => {}
+        }
+    }
+
+    if dirty {
+        // 写失败不打扰：下一次启动会再问一次（标志没落盘 = 自愈）。
+        let _ = config::save_to(&config_path, &cfg);
     }
 }
 
