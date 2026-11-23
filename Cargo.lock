@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "claude-hud"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "chrono",
  "eframe",
