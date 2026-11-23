@@ -396,6 +396,8 @@ pub fn run() -> eframe::Result<()> {
                 pos_stable_since: None,
                 dragging: None,
                 auto_fit_rows: None,
+                last_ppp: None,
+                geom_diag: None,
                 startup_clamped: false,
             }))
         }),
@@ -965,6 +967,44 @@ fn resize_direction_at(
 // 2. **拖动起手是哪种**（`handle_window_drag`）：移动还是缩放。
 // 3. **后台线程 panic**（`run` 里装了钩子）：GUI 从 `explorer.exe` 起，stderr 没人看，
 //    一个 panic 掉的轮询线程与"界面正常但永远不更新"在屏幕上长得一模一样。
+/// 临时诊断用：按标题找到本进程的窗口，取 Win32 **物理像素**矩形。
+///
+/// 进程是 per-monitor aware，所以这里不受系统缩放影响 —— 正好用来和 egui 的
+/// 点坐标对照（跨 DPI 时"窗口到底多大"只能信这一份）。
+fn physical_window_rect() -> Option<(i32, i32, i32, i32)> {
+    #[repr(C)]
+    struct WRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> *mut core::ffi::c_void;
+        fn GetWindowRect(hwnd: *mut core::ffi::c_void, rect: *mut WRect) -> i32;
+    }
+    let title: Vec<u16> = "claude-hud\0".encode_utf16().collect();
+    // SAFETY: 两个参数都是空指针/以 NUL 结尾的宽字符串；返回的是系统持有的窗口句柄，
+    // 只用于紧接着的查询。找不到窗口时返回空指针，已在下面判掉。
+    let hwnd = unsafe { FindWindowW(core::ptr::null(), title.as_ptr()) };
+    if hwnd.is_null() {
+        return None;
+    }
+    let mut r = WRect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: `r` 是本函数栈上的合法结构体；失败时返回 0，此时不读它的内容。
+    let ok = unsafe { GetWindowRect(hwnd, &mut r) };
+    if ok == 0 {
+        return None;
+    }
+    Some((r.left, r.top, r.right, r.bottom))
+}
+
 fn diag_log(msg: &str) {
     if std::fs::metadata(crate::paths::real_diag_enable_path()).is_err() {
         return;
@@ -2209,6 +2249,17 @@ struct App {
     /// 立刻拽回去（那条路已经由拖动/缩放自己管）。条数没变就一律不碰。
     auto_fit_rows: Option<usize>,
 
+    /// 上一帧的 `pixels_per_point`。换显示器 / 改缩放时它会变，而**同一份版面在不同
+    /// 缩放下的高度差几个点**（字体按物理像素取整）⇒ 必须重新贴合一次，否则窗口会
+    /// 沿用旧高度、最后一条会话正好掉出去（2026-11-23 用户报障：切到笔记本屏后
+    /// "只有三行，第四行空白"）。见 [`App::refit_on_scale_change`]。
+    last_ppp: Option<f32>,
+
+    /// 临时诊断：上一帧记过的窗口几何摘要。只在**几何/缩放/显示器变了**时写一行
+    /// （`diag.enable` 才生效）。用于定位「换到笔记本屏幕后显示不对」这类跨 DPI 报障：
+    /// 外面只能看到窗口矩形，看不到 egui 自己认的 ppp 与 inner/outer 点坐标。
+    geom_diag: Option<String>,
+
     /// 启动时的"夹回可见桌面"是否已经做过。
     ///
     /// 这一步需要 `pixels_per_point`（把逻辑点和显示器物理像素换算），而窗口建好之前
@@ -2254,6 +2305,67 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(clamped));
     }
 
+    /// 临时诊断：窗口几何 / 缩放 / 显示器变了就记一行（`diag.enable` 才生效）。
+    ///
+    /// 外部探针只能看到窗口的**物理**矩形，看不到 egui 认的 `pixels_per_point` 与
+    /// inner/outer 的**点坐标**；而「换到笔记本屏幕后显示不对」的根因很可能就藏在这两者
+    /// 对不上里（换屏 = `WM_DPICHANGED` + 窗口被系统重排）。
+    fn log_viewport_geometry(&mut self, ctx: &egui::Context) {
+        if std::fs::metadata(crate::paths::real_diag_enable_path()).is_err() {
+            return;
+        }
+        let ppp = ctx.pixels_per_point();
+        let (outer, inner, minimized, occluded, monitor_size) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.outer_rect,
+                v.inner_rect,
+                v.minimized,
+                v.occluded,
+                v.monitor_size,
+            )
+        });
+        let fmt_rect = |r: Option<egui::Rect>| {
+            r.map(|r| {
+                format!(
+                    "{:.1},{:.1} {:.1}x{:.1}",
+                    r.min.x,
+                    r.min.y,
+                    r.width(),
+                    r.height()
+                )
+            })
+            .unwrap_or_else(|| "-".into())
+        };
+        let mon = outer
+            .and_then(|o| screen::monitor_rect_at_points(o.min + o.size() / 2.0, ppp))
+            .map(|r| {
+                format!(
+                    "{:.0},{:.0} {:.0}x{:.0}",
+                    r.min.x,
+                    r.min.y,
+                    r.width(),
+                    r.height()
+                )
+            })
+            .unwrap_or_else(|| "-".into());
+        // Win32 的**物理像素**窗口矩形：egui 的 outer/inner 是点，跨 DPI 时两者对不上
+        // 正是要查的东西。进程是 per-monitor aware，这里的数不经过系统缩放。
+        let win_px = physical_window_rect()
+            .map(|r| format!("{},{},{},{}", r.0, r.1, r.2, r.3))
+            .unwrap_or_else(|| "-".into());
+        let line = format!(
+            "geom ppp={ppp:.3} win_px=[{win_px}] outer=[{}] inner=[{}] min={minimized:?} occl={occluded:?} mon@pt=[{mon}] mon_size={monitor_size:?}",
+            fmt_rect(outer),
+            fmt_rect(inner),
+        );
+        if self.geom_diag.as_deref() == Some(line.as_str()) {
+            return;
+        }
+        self.geom_diag = Some(line.clone());
+        diag_log(&line);
+    }
+
     /// 记住窗口位置。**每帧调用**，但只有"停稳且真的动了"时才写盘。
     ///
     /// 位置从 `viewport().outer_rect` 取（外框原点）—— 无边框窗口的 outer 与 inner
@@ -2290,6 +2402,24 @@ impl App {
         if config::save_to(&paths::real_config_path(), &self.cfg).is_ok() {
             self.saved_pos = cur_arr;
         }
+    }
+
+    /// 缩放（`pixels_per_point`）变了 ⇒ 强制下一帧重新贴合一次高度。
+    ///
+    /// **为什么必须重贴**：字号是点，但字形按物理像素栅格化、再折回点，同一份版面在
+    /// 100% 与 200% 下量出来的行高/顶栏高会差 **1~3pt**。会话条数没变时
+    /// [`App::auto_fit`] 的"条数没变就不动"闸门会一直按旧高度不动，而 `draw_panel`
+    /// 对放不下的行是**整个不画**（见那里的注释）⇒ 最后一条会话静默消失：窗口还在、
+    /// 高度还是四条的、第四行一片空白。2026-11-23 用户报的"切到笔记本屏幕后只有三行"
+    /// 就是这个（实测：100% 下四条要 380pt，200% 下要 383pt）。
+    ///
+    /// 只在**真的变了**时清一次：同一个缩放不会每帧重贴，用户手动拉出来的高度不会被拽回去。
+    fn refit_on_scale_change(&mut self, ppp: f32) {
+        if self.last_ppp == Some(ppp) {
+            return;
+        }
+        self.last_ppp = Some(ppp);
+        self.auto_fit_rows = None;
     }
 
     /// 会话条数变了 ⇒ 把窗口**高度**贴到"刚好装下"。
@@ -2357,7 +2487,12 @@ fn plan_auto_fit(
     }
     // 2pt 以内当作"不用动"：默认窗 320×380 装四条会话时差 1pt（实测量的余量），
     // 为这 1pt 发一条窗口命令没有意义，还会让"启动后窗口是否跳了一下"变成一个话题。
-    if (height - inner.height()).abs() <= 2.0 {
+    //
+    // ⚠️ **只对"不变 / 变小"宽容**：要长高的时候差多少都得长。`draw_panel` 对放不下的
+    // 最后一条是**整个不画**的，1pt 之差就会静默掉一行（2026-11-23：200% 缩放下
+    // 四条要 383pt 而窗口还是 380pt，差 3pt；差 1pt 的同类情形也不许漏）。
+    let diff = height - inner.height();
+    if diff.abs() <= 2.0 && diff <= 0.0 {
         return None;
     }
     let mut pos = None;
@@ -2403,6 +2538,9 @@ impl eframe::App for App {
         // 所以这一步从 `run()` 挪到了这里；见 `clamp_startup_position`）。
         self.clamp_startup_position(ui.ctx());
 
+        // 临时诊断（2026-11-23）：跨显示器 / 跨 DPI 的几何变化。
+        self.log_viewport_geometry(ui.ctx());
+
         // 窗口位置记忆：拖完之后**停稳 1 秒**才写一次配置（判据是纯函数 `should_save_pos`，
         // 单测钉着）。这里是渲染线程里唯一的写盘，且只在"真的动了"时发生。
         self.remember_window_pos(ui.ctx());
@@ -2413,6 +2551,8 @@ impl eframe::App for App {
 
         // Win32 侧（光标 / 显示器）是物理像素，egui 几何是逻辑点；在入口统一换算一次。
         let ppp = ui.ctx().pixels_per_point();
+        // 换屏 / 改缩放 ⇒ 版面高度会差几个点，必须重新贴合一次（见 `refit_on_scale_change`）。
+        self.refit_on_scale_change(ppp);
         let monitor_at = |p: egui::Pos2| screen::monitor_rect_at_points(p, ppp);
 
         let mut metrics = None;
@@ -3617,6 +3757,8 @@ mod tests {
             saved_pos: [0.0, 0.0],
             dragging: None,
             auto_fit_rows: None,
+            last_ppp: None,
+            geom_diag: None,
             startup_clamped: false,
         }
     }
@@ -3797,6 +3939,80 @@ mod tests {
             auto_fit_commands(&mut app, 1, true, &fit).is_empty(),
             "用户正在拖动/缩放，窗口归他管"
         );
+    }
+
+    /// **换缩放会少一行**（2026-11-23 用户报障的真根因）：
+    /// 同一份版面在 200% 下比 100% 高几个点（字形按物理像素栅格化、再折回点），
+    /// 而窗口沿用旧高度时 `draw_panel` 对放不下的最后一条是**整个不画**的 ——
+    /// 界面上就是"窗口还在、第四行一片空白"。所以缩放变化必须触发一次重新贴合。
+    #[test]
+    fn a_scale_change_needs_a_refit_or_the_last_row_disappears() {
+        let rows: Vec<view::Row> = (0..4)
+            .map(|i| {
+                let mut r = row(&format!("会话{i}"), State::Done, 10 * (i + 1));
+                r.context_pct = Some(0.1 * (i + 1) as f32);
+                r
+            })
+            .collect();
+
+        // 100%：默认窗 320×380 装得下四条。
+        let (shapes, fit) = run_frame_capture_at_ppp(&rows, DEFAULT_INNER_W, DEFAULT_INNER_H, 1.0);
+        assert_eq!(drawn_row_count(&shapes), 4, "100% 下四条必须都在");
+        assert!(
+            fit.delta(4) <= 0.0,
+            "100% 下默认窗装得下四条，实测还差 {}pt",
+            fit.delta(4)
+        );
+
+        // 200%：同样的窗口装不下 —— 这正是线上"第四行空白"的样子。
+        let (shapes_2x, fit_2x) =
+            run_frame_capture_at_ppp(&rows, DEFAULT_INNER_W, DEFAULT_INNER_H, 2.0);
+        let needed = DEFAULT_INNER_H + fit_2x.delta(4);
+        assert!(
+            needed > DEFAULT_INNER_H,
+            "200% 下同一份版面必须更高（实测 {needed}pt）"
+        );
+        assert_eq!(
+            drawn_row_count(&shapes_2x),
+            3,
+            "200% 下 320×380 只画得出三条（第四条被整个跳过）"
+        );
+
+        // 按 `auto_fit` 会算出来的高度再来一帧 ⇒ 四条都回来。
+        let (fixed, _) = run_frame_capture_at_ppp(&rows, DEFAULT_INNER_W, needed, 2.0);
+        assert_eq!(drawn_row_count(&fixed), 4, "贴合到 {needed}pt 后四条必须都在");
+    }
+
+    /// 缩放变化**必须**让 `auto_fit` 重新贴一次；同一个缩放**不许**每帧重贴。
+    #[test]
+    fn a_scale_change_forces_exactly_one_refit() {
+        let mut app = test_app();
+        app.last_ppp = Some(1.0);
+        app.auto_fit_rows = Some(4);
+        app.refit_on_scale_change(2.0);
+        assert_eq!(app.auto_fit_rows, None, "缩放变了 ⇒ 下一帧必须重新贴合高度");
+        assert_eq!(app.last_ppp, Some(2.0));
+
+        app.auto_fit_rows = Some(4);
+        app.refit_on_scale_change(2.0);
+        assert_eq!(app.auto_fit_rows, Some(4), "同一个缩放不许每帧重贴");
+    }
+
+    /// 差 1pt 的"装不下"也得长高 —— 2pt 容忍带**只对不变/变小**成立。
+    #[test]
+    fn auto_fit_always_grows_even_by_a_single_point() {
+        let fit = auto_fit_fixture();
+        let inner = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(320.0, 380.0));
+        let monitor = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(2560.0, 1440.0));
+        // available_h=364，content_h(4)=33+3×94+50.5=365.5 ⇒ 差 1.5pt（落在旧版本的 2pt 容忍带里）
+        let tight = PanelFit {
+            available_h: 364.0,
+            row_h: 50.5,
+            ..fit.clone()
+        };
+        let (size, _) = plan_auto_fit(4, &tight, inner, Some(inner), Some(monitor))
+            .expect("差 1.5pt 也是装不下：必须长高，否则最后一条会被整个跳过");
+        assert_eq!(size.y, 381.5);
     }
 
     /// **贴着窗口边按下再拖，窗口真的被缩放** —— 端到端，断言的是**发给窗口系统的几何**。
@@ -4311,6 +4527,60 @@ mod tests {
         let mut out = Vec::new();
         flatten(&full.shapes, &mut out);
         (out, metrics.expect("draw_panel 必须跑过一次"))
+    }
+
+    /// 与 [`run_frame_capture`] 同一实现，但可以指定 `pixels_per_point`。
+    ///
+    /// 跨显示器 / 跨缩放那类报障只能在这里复现：**同一份版面在不同缩放下高度会差几个点**
+    /// （字形按物理像素栅格化后再折回点）。
+    fn run_frame_capture_at_ppp(
+        rows: &[view::Row],
+        width: f32,
+        height: f32,
+        ppp: f32,
+    ) -> (Vec<egui::Shape>, PanelFit) {
+        let cjk = pick_font(&font_candidates()).map(|(_, bytes)| bytes);
+        let ctx = ctx_with_fonts(build_font_definitions(cjk));
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+        raw.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                native_pixels_per_point: Some(ppp),
+                ..Default::default()
+            },
+        );
+        let mut metrics = None;
+        let mut full = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default()
+                .frame(panel_frame())
+                .show(ui, |ui| {
+                    metrics = Some(draw_panel(
+                        ui,
+                        rows,
+                        &usage::LedgerView::default(),
+                        true,
+                        &config::Config::default(),
+                    ));
+                });
+        });
+        full.textures_delta.clear();
+        let mut out = Vec::new();
+        flatten(&full.shapes, &mut out);
+        (out, metrics.expect("draw_panel 必须跑过一次"))
+    }
+
+    /// 画出来的**会名**条数（每条会话一个，`会话0`…`会话N`）。
+    fn drawn_row_count(shapes: &[egui::Shape]) -> usize {
+        drawn_texts(shapes)
+            .iter()
+            .filter(|(t, _, _)| t.starts_with("会话"))
+            .count()
     }
 
     fn painted_texts(shapes: &[egui::Shape]) -> String {
