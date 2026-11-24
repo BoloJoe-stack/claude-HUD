@@ -1,0 +1,7 @@
+# dsh-hud-bridge —— 插件自带的挂载声明。
+#
+# 它只做一件事：把桥接插件插进 dsh 的插件树。它不配置别的插件、不改别人的槽位，
+# 卸载时把本文件对应的 `dsh-hud-bridge` 从 profile 的 bundles 里去掉即可。
+- insert:
+    - id: hud-bridge
+      name: dsh-hud-bridge

@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 pub struct SessionState {
     pub session_id: String,
     pub cwd: String,
+    /// 这个状态文件由谁写（`docs/dsh桥接-方案-2026-11-24.md` 第 4.1 节）：
+    /// `Some("dsh")` = DeepSeek Harness 的桥接插件；缺失或其它值 = Claude Code。
+    ///
+    /// 三态与 `nested` 同一口径：**改造前写下的老文件没有这个字段 ⇒ `None`**，
+    /// 一律按 Claude 处理 —— 宁可把它归到 Claude 区，也不能因为缺字段就把它藏起来。
+    /// 界面只用它做**分区显示**；存活判定（`claude_pid` / 心跳）不看它。
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<String>,
     #[serde(default)]
@@ -51,6 +59,19 @@ pub struct SessionState {
     /// —— 那是 7.5 ms，见 `procinfo` 顶部那张表。
     #[serde(default)]
     pub nested: Option<bool>,
+    /// dsh 桥接实测的上下文占用（`inputTokens + cacheReadTokens + cacheWriteTokens`）。
+    ///
+    /// `None` = 没有这个事实（Claude 侧的老文件、或 dsh 还没发过 `assistant/message`）。
+    /// 界面优先用它；`None` 时回落到转录派生值，再没有就留空 —— **不编数**。
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    /// dsh 侧上报的上下文上限（`request/context.data.contextWindow`）。
+    ///
+    /// 同样三态：`None` = 不知道 ⇒ 回落用户配置的 `Config::context_limit`。
+    /// 实测 `request/context` 是低频事件（会话第一次请求/换模型才发），所以**大多数行
+    /// 拿到的是 `None`** —— 这是契约允许的，不要为它补默认值。
+    #[serde(default)]
+    pub context_limit: Option<u64>,
     pub state: String,
     pub state_since: i64,
     pub last_event: String,
@@ -142,6 +163,9 @@ mod tests {
         SessionState {
             session_id: id.into(),
             cwd: "D:\\projects\\doc-tasks".into(),
+            provider: None,
+            context_tokens: None,
+            context_limit: None,
             transcript_path: Some("C:\\Users\\user\\.claude\\projects\\x\\y.jsonl".into()),
             display_name: Some("示例项目报告排版修复".into()),
             claude_pid: Some(4242),
@@ -195,12 +219,26 @@ mod tests {
         let s = load_one(&d, "old").expect("缺新字段的老文件必须能读");
         assert_eq!(s.session_id, "old");
         assert_eq!(s.nested, None, "没有这个字段 ⇒ None，不是 Some(false)");
+        assert_eq!(
+            s.provider, None,
+            "没有 provider 字段 ⇒ None（按 Claude 处理），不是 Some(\"dsh\")"
+        );
         assert_eq!(s.claude_pid, None);
         assert_eq!(
             s.claude_start, None,
             "没有创建时间 ⇒ None（退回老判据），不是 Some(0)（那会判死真会话）"
         );
         assert_eq!(list_all(&d).len(), 1, "老文件不能被当成坏文件跳掉");
+    }
+
+    #[test]
+    fn provider_round_trips_for_a_dsh_file() {
+        // 桥接插件写的是 `provider: "dsh"`；挂件读出来必须原样保留，界面靠它分区。
+        let d = tempdir("provider");
+        let mut s = sample("session-abc");
+        s.provider = Some("dsh".into());
+        save_atomic(&d, &s).unwrap();
+        assert_eq!(load_one(&d, "session-abc").unwrap().provider.as_deref(), Some("dsh"));
     }
 
     #[test]

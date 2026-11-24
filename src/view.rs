@@ -30,6 +30,11 @@ pub enum Progress {
 #[derive(Debug, Clone)]
 pub struct Row {
     pub session_id: String,
+    /// 这条会话来自哪个工具：`true` = DeepSeek Harness（dsh），`false` = Claude Code。
+    ///
+    /// 界面按它**分区**：Claude 在上、dsh 在下，中间一条分隔线 + 「dsh」小标题
+    /// （用户 2026-11-24 裁定）。排序也先按它分组，组内沿用原来的四组优先级与"越久越前"。
+    pub is_dsh: bool,
     pub name: String,
     pub state: State,
     pub elapsed_secs: i64,
@@ -277,10 +282,14 @@ pub fn build_rows_with_deltas(
             // 上下文 token 与占比由 Task 12 的 `build_rows_with_deltas` 从
             // `transcript::Delta` 提供（`poller::refresh` 每轮把 transcript 增量折叠进去）。
             // 没有 delta（会话无 transcript 路径、或文件还没读到）时留空。
-            let context_tokens = delta.and_then(|d| d.context_tokens);
-            // 上限没配置（`None`）时**不算百分比**：0 或 1M 都是编出来的数，
+            // 来源优先级（方案 `dsh桥接` §6）：**会话自带的数**优先，读不到才回落到
+            // 转录派生的 `Delta`。dsh 行没有转录可解析，它的数只能来自状态文件。
+            let context_tokens = s.context_tokens.or_else(|| delta.and_then(|d| d.context_tokens));
+            // 上限同理：dsh 上报的 `context_limit`（实测大多是 `None`）优先，否则用全局配置。
+            let context_limit = s.context_limit.or(cfg.context_limit);
+            // 上限拿不到（`None`）时**不算百分比**：0 或 1M 都是编出来的数，
             // 而"看起来合理但错 5 倍"正是本项目点名的危险失效。界面会显示 `上下文 --`。
-            let context_pct = match (context_tokens, cfg.context_limit) {
+            let context_pct = match (context_tokens, context_limit) {
                 (Some(t), Some(limit)) if limit > 0 => Some((t as f64 / limit as f64) as f32),
                 _ => None,
             };
@@ -310,12 +319,13 @@ pub fn build_rows_with_deltas(
             (
                 Row {
                     session_id: s.session_id.clone(),
+                    is_dsh: s.provider.as_deref() == Some("dsh"),
                     name,
                     state,
                     elapsed_secs: (now - s.state_since).max(0),
                     detail,
                     context_tokens,
-                    context_limit: cfg.context_limit,
+                    context_limit,
                     context_pct,
                     progress,
                     subtitle,
@@ -337,8 +347,11 @@ pub fn build_rows_with_deltas(
     // 一条"工作中干了 40 分钟"的会话，最近一次活动是 2 秒前，按旧口径它会排到最后、
     // 按新口径排到最前 —— 用户要的是后者。
     keyed.sort_by(|(a, _), (b, _)| {
-        priority(a.state)
-            .cmp(&priority(b.state))
+        // 第一关键字是来源：Claude 一律在前、dsh 一律在后（用户 2026-11-24："要分开"）。
+        // 组内仍然用原来的口径，两个组各自排各自的。
+        a.is_dsh
+            .cmp(&b.is_dsh)
+            .then_with(|| priority(a.state).cmp(&priority(b.state)))
             .then_with(|| b.elapsed_secs.cmp(&a.elapsed_secs))
     });
 
@@ -347,6 +360,16 @@ pub fn build_rows_with_deltas(
 
 pub fn aggregate(rows: &[Row]) -> Option<State> {
     rows.iter().map(|r| r.state).min_by_key(|s| priority(*s))
+}
+
+/// 界面上要画几条**分区标题**（分隔线 + 「dsh」小字）。
+///
+/// 只有两个区都存在时才需要一条：只有 Claude 或只有 dsh 时没有必要分隔，
+/// 顶栏的计数已经把来源说清楚了。目前最多 1 条。
+pub fn section_count(rows: &[Row]) -> usize {
+    let has_dsh = rows.iter().any(|r| r.is_dsh);
+    let has_claude = rows.iter().any(|r| !r.is_dsh);
+    usize::from(has_dsh && has_claude)
 }
 
 #[cfg(test)]
@@ -358,6 +381,9 @@ mod tests {
         SessionState {
             session_id: id.into(),
             cwd: format!("D:\\work\\{}", id),
+            provider: None,
+            context_tokens: None,
+            context_limit: None,
             transcript_path: None,
             display_name: None,
             claude_pid: None,
@@ -490,6 +516,84 @@ mod tests {
     fn empty_input_yields_no_rows() {
         assert!(build_rows(&[], &Config::default(), 100).is_empty());
     }
+
+    // ── 来源分区（2026-11-24 用户裁定："claude 会话和 dsh 会话要分开"） ──
+
+    fn dsh(id: &str, state: &str, since: i64) -> SessionState {
+        let mut s = st(id, state, since, since);
+        s.provider = Some("dsh".into());
+        s
+    }
+
+    #[test]
+    fn dsh_rows_always_sort_after_claude_rows() {
+        // 故意让 dsh 行处于"更该靠前"的状态（错误组），Claude 行处于工作中组：
+        // 分区是**第一关键字**，组内优先级不能把 dsh 提到 Claude 前面。
+        let states = vec![
+            dsh("session-err", "error", 10),
+            st("claude-work", "working", 10, 10),
+            dsh("session-work", "working", 10),
+            st("claude-done", "done", 10, 10),
+        ];
+        let rows = build_rows(&states, &Config::default(), 100);
+        let flags: Vec<bool> = rows.iter().map(|r| r.is_dsh).collect();
+        assert_eq!(
+            flags,
+            vec![false, false, true, true],
+            "Claude 一律在前、dsh 一律在后；组内仍按错误>完成>待办>工作"
+        );
+        assert_eq!(rows[2].session_id, "session-err", "dsh 组内仍是错误优先");
+    }
+
+    #[test]
+    fn section_count_is_one_only_when_both_origins_are_present() {
+        let both = build_rows(
+            &[st("c", "working", 10, 10), dsh("d", "working", 10)],
+            &Config::default(),
+            100,
+        );
+        assert_eq!(section_count(&both), 1);
+
+        let only_claude = build_rows(&[st("c", "working", 10, 10)], &Config::default(), 100);
+        assert_eq!(section_count(&only_claude), 0, "只有 Claude 时不需要分区标题");
+
+        let only_dsh = build_rows(&[dsh("d", "working", 10)], &Config::default(), 100);
+        assert_eq!(section_count(&only_dsh), 0, "只有 dsh 时也不需要");
+    }
+
+    // ── 上下文来源（方案 §6）：会话自带的数优先，缺失才回落 ──
+
+    #[test]
+    fn a_sessions_own_context_beats_the_global_limit() {
+        let mut d = dsh("session-1", "working", 10);
+        d.context_tokens = Some(250_000);
+        d.context_limit = Some(1_000_000);
+        let mut cfg = Config::default();
+        cfg.context_limit = Some(100_000); // 全局配置必须输给会话自带的
+        let rows = build_rows(&[d], &cfg, 100);
+        assert_eq!(rows[0].context_tokens, Some(250_000));
+        assert_eq!(rows[0].context_limit, Some(1_000_000));
+        assert!((rows[0].context_pct.unwrap() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_session_without_its_own_limit_falls_back_to_the_global_one() {
+        let mut d = dsh("session-1", "working", 10);
+        d.context_tokens = Some(50_000);
+        let mut cfg = Config::default();
+        cfg.context_limit = Some(100_000);
+        let rows = build_rows(&[d], &cfg, 100);
+        assert_eq!(rows[0].context_limit, Some(100_000));
+        assert!((rows[0].context_pct.unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_context_facts_means_no_percentage() {
+        // 没有 token 数、也没有上限 ⇒ 不许编百分比（界面显示 `上下文 --`）
+        let rows = build_rows(&[dsh("session-1", "working", 10)], &Config::default(), 100);
+        assert_eq!(rows[0].context_tokens, None);
+        assert_eq!(rows[0].context_pct, None);
+    }
 }
 
 #[cfg(test)]
@@ -504,6 +608,9 @@ mod wire_tests {
         SessionState {
             session_id: id.into(),
             cwd: "D:\\work\\proj".into(),
+            provider: None,
+            context_tokens: None,
+            context_limit: None,
             transcript_path: None,
             display_name: Some("样例项目".into()),
             claude_pid: None,

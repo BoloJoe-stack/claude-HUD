@@ -172,6 +172,34 @@ fn rule(ui: &mut egui::Ui) {
     );
 }
 
+/// 分区条：一条通栏浅灰底，左起写一个小字（`claude` / `dsh`）。
+///
+/// 用户 2026-11-24 裁定（两版对比稿）：两条都用 `#f0f0f0` 同灰底，**条内文字加粗**。
+/// 用色块而不是线，是本项目一贯的界面约定（线只出现在新模块开始处，且一页 5~8 条）。
+///
+/// ⚠️ **egui 的 `FontId` 没有字重**（`RichText::strong()` 只改颜色，不改字形）。
+/// 这里用一次 **0.4pt 水平偏移重绘** 模拟粗体：小字号下看上去就是加粗，且不引入
+/// 第二种字体。别为"真正的粗体"去注册第二套字体族 —— 那会把行高与四段间距全拖下水。
+fn section_band(ui: &mut egui::Ui, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), SECTION_BAND_H),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0.0, SECTION_BAND_FILL);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::new(SECTION_SIZE, egui::FontFamily::Proportional),
+        SECTION_BAND_TEXT,
+    );
+    let pos = egui::pos2(
+        rect.left() + SECTION_BAND_PAD,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(pos, galley.clone(), SECTION_BAND_TEXT);
+    ui.painter()
+        .galley(pos + egui::vec2(0.4, 0.0), galley, SECTION_BAND_TEXT);
+}
+
 /// 会话行里"今日 token"那一格的字号与颜色。
 ///
 /// 放在**第二行**（见 `draw_row` 里的说明：放第一行会把会名挤没，实测过）。
@@ -190,6 +218,27 @@ fn rule(ui: &mut egui::Ui) {
 /// 颜色取中性灰而不是纯黑：黑留给会名（主信息）。
 const TOKENS_SIZE: f32 = CONTEXT_SIZE;
 const TOKENS_COLOR: egui::Color32 = egui::Color32::from_rgb(0x5a, 0x5a, 0x5a);
+
+/// 分区条（`claude` / `dsh` 两条通栏浅灰底）的字号。
+///
+/// 取第二行的字号（`CONTEXT_SIZE`），**不新增一种字号** —— 理由与 [`TOKENS_SIZE`]
+/// 相同：同一号字不额外收费，行高与四段间距都不用重标。
+const SECTION_SIZE: f32 = CONTEXT_SIZE;
+/// 分区条的底色。用户 2026-11-24 在两版对比稿里选定的 `#f0f0f0`（两条同灰）。
+const SECTION_BAND_FILL: egui::Color32 = egui::Color32::from_rgb(0xF0, 0xF0, 0xF0);
+/// 分区条上文字的颜色（用户要求加粗；字重见 [`section_band`] 的说明）。
+const SECTION_BAND_TEXT: egui::Color32 = egui::Color32::from_rgb(0x22, 0x22, 0x22);
+/// 分区条的高度。
+const SECTION_BAND_H: f32 = 20.0;
+/// 条内文字距左缘的空隙（与行首色块的 `BAR_WIDTH + 间距` 对齐，读起来是同一列）。
+const SECTION_BAND_PAD: f32 = 12.0;
+/// 分区条下方的空隙。
+const SECTION_BAND_BOTTOM_GAP: f32 = 12.0;
+/// 分区条**作为两条会话之间的边界**时、上方补的空隙。
+///
+/// 合计必须与普通行距逐点相等：`ROW_BOTTOM_GAP 8 + 6 + 条高 20 + 12 = 46`
+/// （原来那条细线 + `EXTRA_ROW_GAP 38` 也是 46）⇒ `row_advance` 与自动贴合零改动。
+const SECTION_BAND_TOP_GAP: f32 = 6.0;
 
 /// 顶栏那条**不含数码子集**的字体族名。用户 2026-09-15 裁定："大标题里的所有字体都
 /// 统一，不用数码"。
@@ -215,8 +264,12 @@ const EXITED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x6b, 0x6b);
 /// 提到 380 的理由是**用户声明的上限 = 4 条会话**：一条会话 44pt 高、相邻两条相隔 94pt，
 /// 4 条需要 `41 + 3×94 + 44 = 367pt`，加下内边距 ⇒ 380 才装得下。
 /// 由 `four_sessions_all_fit_at_the_default_size` 守着。
+///
+/// 2026-11-24 加分区条后 **380 → 412**：顶栏下多一条 20pt 灰条 + 12pt 空隙，共 +32。
+/// 不靠"启动后自动贴合再长高"来补 —— 那会让第一帧只画 3 条，正是用户 09-17 报过的
+/// "四个会话为什么只显示了 3 个"。
 const DEFAULT_INNER_W: f32 = 320.0;
-const DEFAULT_INNER_H: f32 = 380.0;
+const DEFAULT_INNER_H: f32 = 412.0;
 
 /// 窗口**最小宽度**。**这个值现在只由"会名还剩几个字"决定。**
 ///
@@ -648,6 +701,35 @@ fn no_cjk_message(candidates: &[PathBuf]) -> String {
 /// 而挂件不写回，所以盘上的 `transcript_offset` 恒为 0。若不复用内存里的
 /// offset，每轮都会从头重读整份 transcript —— 实测 5 个会话 88 MB 每轮 730 ms，
 /// 等于每秒白烧 0.7 秒 IO（这是"界面卡顿"的真正主因，不是只有第一轮慢）。
+/// 桥接心跳的过期阈值（秒）。方案 §4.2：15 秒一跳，允许连续丢 6 次 ⇒ 90 秒。
+const DSH_HEARTBEAT_STALE_SECS: i64 = 90;
+
+/// 心跳文件位置 = **状态目录的上一级**（`%APPDATA%\claude-hud\dsh-bridge.json`）。
+///
+/// 故意从 `sessions_dir` 推，而不是再取一次 `%APPDATA%`：集成测试用
+/// `CLAUDE_HUD_SESSIONS_DIR` 指到临时目录时，心跳自然跟着落在它的兄弟位置，
+/// 不需要再加一个环境变量。
+fn dsh_heartbeat_path(sessions_dir: &Path) -> PathBuf {
+    sessions_dir
+        .parent()
+        .map(|p| p.join("dsh-bridge.json"))
+        .unwrap_or_else(|| sessions_dir.join("dsh-bridge.json"))
+}
+
+/// 桥接心跳还活着吗。文件缺失 / 读不出 / 没有 `heartbeat_at` 一律算**不活** ——
+/// 方案 §4.2：文件缺失且存在 dsh 行时，视为桥接不可用，全部标记「已退出」。
+fn dsh_bridge_alive(heartbeat: &Path, now: i64) -> bool {
+    let Ok(text) = std::fs::read_to_string(heartbeat) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    v.get("heartbeat_at")
+        .and_then(|x| x.as_i64())
+        .is_some_and(|at| now - at <= DSH_HEARTBEAT_STALE_SECS)
+}
+
 fn poll_once(
     dir: &Path,
     deltas: &mut HashMap<String, transcript::Delta>,
@@ -697,12 +779,26 @@ fn poll_once(
     //
     // 判错不吃亏：真会话下一轮 `host_is_gone` 返回假 ⇒ streak 归零 ⇒ 照常画出来
     // （只晚一轮，且**不会被移除**）—— 与 09-15 那条裁定的安全方向一致。
+    //
+    // dsh 行例外（方案 §4.2）：它们没有 `claude_pid`，存活完全由**桥接心跳**承担。
+    // 没有 dsh 行时连文件都不读（零开销）。
+    let has_dsh = states
+        .iter()
+        .any(|s| s.provider.as_deref() == Some("dsh"));
+    let bridge_alive = !has_dsh || dsh_bridge_alive(&dsh_heartbeat_path(dir), now);
+
     let mut gone: HashSet<String> = HashSet::new();
     let mut never_shown: HashSet<String> = HashSet::new();
     for s in states.iter() {
         let first_sight = !dead_streak.contains_key(&s.session_id);
         let streak = dead_streak.entry(s.session_id.clone()).or_insert(0);
-        *streak = if host_is_gone(s, procinfo::HOST_EXE) {
+        *streak = if s.provider.as_deref() == Some("dsh") {
+            if bridge_alive {
+                0
+            } else {
+                *streak + 1
+            }
+        } else if host_is_gone(s, procinfo::HOST_EXE) {
             *streak + 1
         } else {
             0
@@ -1883,7 +1979,14 @@ fn running_label(ui: &egui::Ui, row: &view::Row) -> Option<String> {
 ///
 /// 会名的截断见 `row_name`：用户顾虑"长会名把计时挤出窗口"，
 /// 裁定**加省略号**，且"计时与状态词必须始终完整可见"。
-fn draw_row(ui: &mut egui::Ui, row: &view::Row, ledger: &usage::LedgerView, bar_color: egui::Color32, cfg: &config::Config) {
+fn draw_row(
+    ui: &mut egui::Ui,
+    row: &view::Row,
+    ledger: &usage::LedgerView,
+    bar_color: egui::Color32,
+    cfg: &config::Config,
+    next_section: Option<&str>,
+) {
     // 两行的行高各自现算 —— `paint_right` 要它当居中基准。
     //
     // 第一行取**这一行里每一个字块的最高者**。三个都要算进来，别只取会名与状态词：
@@ -2022,9 +2125,22 @@ fn draw_row(ui: &mut egui::Ui, row: &view::Row, ledger: &usage::LedgerView, bar_
     }
 
     ui.add_space(ROW_BOTTOM_GAP);
-    rule(ui);
-    // 会话之间再补一段空白 —— 用户裁定"间距扩大一倍"，依据见 `EXTRA_ROW_GAP`。
-    ui.add_space(EXTRA_ROW_GAP);
+    match next_section {
+        // 分区边界：线还在，只是把「dsh」两个字压在线上，**总高度与普通行距逐点相等**
+        // （ROW_BOTTOM_GAP + 字高 + 余量 = 8 + 12 + 26 = 46 = 8 + 0 + 38）。
+        // 这样自动贴合、`row_advance`、四段间距一条都不用重标 —— 分区的代价是零。
+        Some(label) => {
+            // 8（行尾）+ 6 + 条高 20 + 12 = 46 = 原来的 8 + 细线 + 38 ⇒ 行距不变
+            ui.add_space(SECTION_BAND_TOP_GAP);
+            section_band(ui, label);
+            ui.add_space(SECTION_BAND_BOTTOM_GAP);
+        }
+        None => {
+            rule(ui);
+            // 会话之间再补一段空白 —— 用户裁定"间距扩大一倍"，依据见 `EXTRA_ROW_GAP`。
+            ui.add_space(EXTRA_ROW_GAP);
+        }
+    }
 }
 
 /// 这一帧量到的**纵向版面**，给"窗口跟着会话条数自动贴合"用（见 [`App::auto_fit`]）。
@@ -2103,9 +2219,27 @@ fn draw_panel(
     //
     // 会话数原先只认 `first_scan_done` 之外什么都不认，于是启动头一秒显示
     // "● claude 会话 · **0 个**"，一秒后跳成真实条数（遗留 #6）。
-    let mut header = "● claude 会话".to_owned();
+    //
+    // 2026-11-24：出现 dsh 会话时，顶栏要把两个来源分开数（用户："要分开，这样我才知道
+    // 哪个是哪个"）。只有 Claude 时**逐字保持原文案**（方案 §8 验收第 2 条）。
+    let dsh_count = rows.iter().filter(|r| r.is_dsh).count();
+    let claude_count = rows.len() - dsh_count;
+    let mut header = if dsh_count > 0 {
+        "● 会话".to_owned()
+    } else {
+        "● claude 会话".to_owned()
+    };
     if first_scan_done {
-        header.push_str(&format!(" · {} 个", rows.len()));
+        if dsh_count > 0 {
+            header.push_str(&format!(
+                " · {} 个（claude {} · dsh {}）",
+                rows.len(),
+                claude_count,
+                dsh_count
+            ));
+        } else {
+            header.push_str(&format!(" · {} 个", rows.len()));
+        }
     }
     if ledger.day().is_some() {
         header.push_str(&format!(" · 全部 {}", usage::fmt_tokens(ledger.total)));
@@ -2121,6 +2255,13 @@ fn draw_panel(
     // 顶栏与正文之间留一段明确空白（用户 2026-09-15 第三轮裁定 16pt）——
     // 改前只有 6pt，比会话内部两行之间的 8pt 还紧，层级是倒的。见 `HEADER_GAP`。
     ui.add_space(HEADER_GAP);
+
+    // 第一个分区的条（`claude` 或 `dsh`）。画在**量 `header_h` 之前**，它就成了
+    // "头部"的一部分 —— 自动贴合会自动把它算进去，`PanelFit` 一个字段都不用加。
+    if let Some(first) = rows.first() {
+        section_band(ui, if first.is_dsh { "dsh" } else { "claude" });
+        ui.add_space(SECTION_BAND_BOTTOM_GAP);
+    }
 
     // ---- 这一帧的纵向版面（自动贴合要用）--------------------------------------
     let content_top = ui.max_rect().top();
@@ -2187,7 +2328,18 @@ fn draw_panel(
         if ui.cursor().min.y + one_row_h > ui.max_rect().bottom() {
             break;
         }
-        draw_row(ui, row, ledger, colors.get(i).copied().unwrap_or_else(|| hash_color(&row.session_id)), cfg);
+        // 分区边界：最后一条 Claude 行之后、第一条 dsh 行之前，把那条普通分隔线
+        // 换成带「dsh」小字的标题线。**只有当下一行也真的画得下时**才换 ——
+        // 否则会出现一条写着 dsh、底下却没有 dsh 行的线。
+        let boundary = i + 1 < rows.len() && i + 1 < fit && rows[i + 1].is_dsh && !row.is_dsh;
+        draw_row(
+            ui,
+            row,
+            ledger,
+            colors.get(i).copied().unwrap_or_else(|| hash_color(&row.session_id)),
+            cfg,
+            boundary.then_some("dsh"),
+        );
     }
     metrics
 }
@@ -2942,6 +3094,9 @@ mod tests {
         SessionState {
             session_id: session_id.into(),
             cwd: "D:\\w".into(),
+            provider: None,
+            context_tokens: None,
+            context_limit: None,
             transcript_path: Some(transcript.to_string_lossy().to_string()),
             display_name: None,
             claude_pid,
@@ -2956,6 +3111,96 @@ mod tests {
             // 盘上恒为 0：挂件不写状态文件（Ruling #6），所以 offset 只能靠内存复用
             transcript_offset: 0,
         }
+    }
+
+    // ---- dsh 桥接心跳（方案 §4.2）-------------------------------------------
+
+    fn dsh_session(id: &str) -> SessionState {
+        // dsh 不写 claude_pid：存活完全靠心跳，不是 pid 判据
+        let mut s = session_state(id, Path::new("nope.jsonl"), None, None, None);
+        s.provider = Some("dsh".into());
+        s.transcript_path = None;
+        s.context_tokens = Some(300_000);
+        s.context_limit = Some(1_000_000);
+        s
+    }
+
+    fn write_heartbeat(root: &Path, at: i64) {
+        std::fs::write(
+            root.join("dsh-bridge.json"),
+            format!(
+                r#"{{"contract":1,"version":"1.0.5","pid":1,"heartbeat_at":{at},"sessions":1}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dsh_rows_are_hidden_once_the_bridge_heartbeat_goes_stale() {
+        let root = tempdir("dshhb");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        crate::state::save_atomic(&sessions, &dsh_session("session-1")).unwrap();
+        write_heartbeat(&root, 10_000);
+        let cfg = config::Config::default();
+
+        let mut deltas = HashMap::new();
+        let mut offsets = HashMap::new();
+        let mut streak = HashMap::new();
+
+        // 差 90 秒整：方案写的是「> 90 秒才算过期」，边界上仍算活着
+        let rows = poll_once(&sessions, &mut deltas, &mut offsets, &mut streak, &cfg, 10_090);
+        assert_eq!(rows.len(), 1, "心跳仍在容忍范围内时必须画出来");
+        assert!(!rows[0].host_gone);
+
+        // 91 秒：标「已退出」，但这一轮还画（沿用两轮确认的老裁定）
+        let rows = poll_once(&sessions, &mut deltas, &mut offsets, &mut streak, &cfg, 10_091);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].host_gone, "心跳过期后必须显示「已退出」");
+
+        // 再一轮：移除
+        let rows = poll_once(&sessions, &mut deltas, &mut offsets, &mut streak, &cfg, 10_092);
+        assert!(rows.is_empty(), "连续两轮确认后必须移除 dsh 行");
+    }
+
+    #[test]
+    fn a_dsh_row_without_any_heartbeat_is_dropped_on_first_sight() {
+        let root = tempdir("dshnohb");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        crate::state::save_atomic(&sessions, &dsh_session("session-1")).unwrap();
+        // 没有心跳文件 = 桥接不可用（残留状态文件多半来自上一次 dsh 崩溃）
+
+        let rows = poll_once(
+            &sessions,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &config::Config::default(),
+            5_000,
+        );
+        assert!(rows.is_empty(), "从未显示过的 dsh 残骸不许闪一下");
+    }
+
+    #[test]
+    fn a_stale_bridge_heartbeat_does_not_touch_claude_rows() {
+        let root = tempdir("dshmixed");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        crate::state::save_atomic(&sessions, &dsh_session("session-1")).unwrap();
+        // Claude 侧：没有 claude_pid ⇒ 不做 pid 判定，永远照常画
+        state_file(&sessions, "claude-1", &root.join("claude.jsonl"));
+
+        let rows = poll_once(
+            &sessions,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &config::Config::default(),
+            5_000,
+        );
+        assert_eq!(rows.len(), 1, "dsh 行被摘掉，Claude 行必须留下：{rows:?}");
+        assert_eq!(rows[0].session_id, "claude-1");
     }
 
     // ---- 选字体（本任务唯一"必须单测"的纯逻辑）--------------------------------
@@ -3666,12 +3911,13 @@ mod tests {
             })
             .collect();
 
-        // 窗高 380 = 默认，画 4 条；286 少画一条（`row_advance` 约 94pt）。两个数都断言，
-        // 免得哪天行高常量一动，这条就悄悄退化成"渲染了同一个画面"。
+        // 默认窗高（412，含分区条的 32pt）画 4 条；330 少画一条（`row_advance` 约 94pt，
+        // 头部含分区条约 76pt）。两个数都断言，免得哪天行高常量一动，这条就悄悄退化
+        // 成"渲染了同一个画面"。
         let tall = bar_colors_by_name(&run_frame_sized(&rows, DEFAULT_INNER_W, DEFAULT_INNER_H, &config::Config::default()));
-        let short = bar_colors_by_name(&run_frame_sized(&rows, DEFAULT_INNER_W, 286.0, &config::Config::default()));
+        let short = bar_colors_by_name(&run_frame_sized(&rows, DEFAULT_INNER_W, 330.0, &config::Config::default()));
         assert_eq!(tall.len(), 4, "默认窗高该画 4 条：{tall:?}");
-        assert_eq!(short.len(), 3, "286pt 该画 3 条：{short:?}");
+        assert_eq!(short.len(), 3, "330pt 该画 3 条：{short:?}");
 
         for (name, c) in short.iter() {
             let (_, c2) = tall
@@ -4354,6 +4600,7 @@ mod tests {
     fn row(name: &str, state: State, elapsed: i64) -> view::Row {
         view::Row {
             session_id: "s1".into(),
+            is_dsh: false,
             name: name.into(),
             state,
             elapsed_secs: elapsed,
@@ -6120,6 +6367,78 @@ mod tests {
         assert!(texts.iter().any(|t| t == "0"), "会话乙今天没用量，写 0 而不是空着：{texts:?}");
     }
 
+    /// **来源分区**（2026-11-24 用户裁定）：Claude 行与 dsh 行之间画一条带「dsh」
+    /// 小字的分隔线，顶栏把两类分开计数。
+    #[test]
+    fn a_dsh_section_header_is_drawn_between_the_two_origins() {
+        let mut c = row("Claude 会话", State::Working, 10);
+        c.session_id = "c1".into();
+        let mut d = row("dsh 会话", State::Working, 20);
+        d.session_id = "session-1".into();
+        d.is_dsh = true;
+
+        let shapes = run_frame_sized(&[c, d], 320.0, 420.0, &config::Config::default());
+        let texts: Vec<String> = drawn_texts(&shapes).into_iter().map(|(t, _, _)| t).collect();
+
+        assert!(
+            texts.iter().any(|t| t == "claude"),
+            "Claude 区顶上要有 claude 分区条：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "dsh"),
+            "Claude 与 dsh 之间必须有 dsh 分区条：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "● 会话 · 2 个（claude 1 · dsh 1）"),
+            "有两个来源时顶栏要分开计数：{texts:?}"
+        );
+    }
+
+    /// 分区条本身：一块 `#f0f0f0` 的实心矩形 + 文字画两遍（egui 没有字重，粗体靠重绘模拟）。
+    #[test]
+    fn a_section_band_is_a_filled_rect_with_the_label_painted_twice() {
+        let mut c = row("Claude 会话", State::Working, 10);
+        c.session_id = "c1".into();
+        let shapes = run_frame_sized(&[c], 320.0, 300.0, &config::Config::default());
+        let bands = shapes
+            .iter()
+            .filter(|s| matches!(s, egui::Shape::Rect(r) if r.fill == SECTION_BAND_FILL))
+            .count();
+        assert_eq!(bands, 1, "claude 分区条必须是一块实心灰底");
+        let labels = drawn_texts(&shapes)
+            .into_iter()
+            .filter(|(t, _, _)| t == "claude")
+            .count();
+        assert_eq!(labels, 2, "“加粗”是同一段文字重绘一次模拟的：{labels}");
+    }
+
+    /// 只有 Claude 时顶栏**逐字**保持原文案；分区条仍画，但只画 `claude` 一条。
+    #[test]
+    fn only_claude_rows_keep_the_original_header_and_only_one_band() {
+        let mut c = row("Claude 会话", State::Working, 10);
+        c.session_id = "c1".into();
+        let shapes = run_frame_sized(&[c], 320.0, 300.0, &config::Config::default());
+        let texts: Vec<String> = drawn_texts(&shapes).into_iter().map(|(t, _, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "● claude 会话 · 1 个"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "claude"), "Claude 区顶上要有 claude 分区条：{texts:?}");
+        assert!(!texts.iter().any(|t| t == "dsh"), "没有 dsh 行就不该有 dsh 分区条");
+    }
+
+    /// 只有 dsh 时，顶上那条是 `dsh`，不会凭空出现 `claude` 条。
+    #[test]
+    fn only_dsh_rows_get_a_single_dsh_band() {
+        let mut d = row("dsh 会话", State::Working, 10);
+        d.session_id = "session-1".into();
+        d.is_dsh = true;
+        let shapes = run_frame_sized(&[d], 320.0, 300.0, &config::Config::default());
+        let texts: Vec<String> = drawn_texts(&shapes).into_iter().map(|(t, _, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "dsh"), "dsh 区顶上要有 dsh 分区条：{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "claude"),
+            "只有 dsh 行时不该画 claude 分区条：{texts:?}"
+        );
+    }
+
     /// **没扫过账本时不写那个数**（启动头一帧）—— 写 `全部 0` 会把"还不知道"说成"今天没用"。
     #[test]
     fn the_header_omits_the_total_before_the_first_scan() {
@@ -6633,8 +6952,10 @@ mod tests {
         // 常数只是旋钮，**被裁定的是界面上那个数**。
         // 顶栏自己与它的分隔线之间**不**该拉开 —— 那条线属于顶栏（阈值也是 0，不是"小于 16"：
         // 单边宽阈值会把"线浮到离顶栏 15pt"这种走样放过去，复审实测过）。
+        // 2026-11-24 加分区条：顶栏下先是一条 20pt 的 `claude` 灰条，再 12pt 到第一条会话
+        // ⇒ 16（`HEADER_GAP`）+ 20（条高）+ 12（条下空隙）= 48。
         let gap_header = rect_of("AAA").top() - rules[0];
-        assert!(close(gap_header, 16.0), "顶栏→第一条会话应为 16pt，实测 {gap_header}");
+        assert!(close(gap_header, 48.0), "顶栏→第一条会话应为 48pt，实测 {gap_header}");
         assert!(
             close(rules[0] - header.bottom(), 0.0),
             "分隔线应该**紧贴**顶栏（0pt），实测 {}",

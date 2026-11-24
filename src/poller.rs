@@ -284,6 +284,9 @@ mod tests {
         SessionState {
             session_id: "p1".into(),
             cwd: "D:\\w".into(),
+            provider: None,
+            context_tokens: None,
+            context_limit: None,
             transcript_path: Some(transcript.to_string_lossy().to_string()),
             display_name: None,
             claude_pid: None,

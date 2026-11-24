@@ -1,0 +1,25 @@
+{
+  "name": "dsh-hud-bridge",
+  "version": "1.0.5",
+  "description": "把 DeepSeek Harness 的会话状态写给 claude-hud（只读消费者）",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "src/host.js",
+  "exports": {
+    ".": "./src/host.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

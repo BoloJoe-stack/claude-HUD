@@ -228,6 +228,9 @@ fn handle_with(
     let prev = existing.unwrap_or(SessionState {
         session_id: p.session_id.clone(),
         cwd: p.cwd.clone(),
+        provider: None,
+        context_tokens: None,
+        context_limit: None,
         transcript_path: None,
         display_name: None,
         claude_pid: None,
@@ -259,6 +262,10 @@ fn handle_with(
     let next = SessionState {
         session_id: p.session_id.clone(),
         cwd: p.cwd.clone(),
+        // hook 只写 Claude 的会话；dsh 的状态文件由桥接插件独占，这里不碰它的来源标记
+        provider: None,
+        context_tokens: None,
+        context_limit: None,
         // payload 给了就更新，没给就保留——SessionStart 之后的事件不一定带 transcript_path
         transcript_path: p
             .transcript_path
@@ -453,6 +460,9 @@ mod handle_tests {
         let s = SessionState {
             session_id: id.into(),
             cwd: "D:\\w".into(),
+            provider: None,
+        context_tokens: None,
+        context_limit: None,
             transcript_path: None,
             display_name: None,
             claude_pid: pid,
