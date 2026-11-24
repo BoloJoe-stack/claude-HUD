@@ -268,6 +268,10 @@ const EXITED_COLOR: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x6b, 0x6b);
 /// 2026-11-24 加分区条后 **380 → 412**：顶栏下多一条 20pt 灰条 + 12pt 空隙，共 +32。
 /// 不靠"启动后自动贴合再长高"来补 —— 那会让第一帧只画 3 条，正是用户 09-17 报过的
 /// "四个会话为什么只显示了 3 个"。
+///
+/// 同日晚些时候灰条改成**只在两个来源同时存在时才画**，于是只有一个来源时这里会
+/// 多出 32pt 的余量。**不回收**：那 32pt 由自动贴合在第二帧缩掉，而回收成 380 会让
+/// 并跑 dsh 的那一档第一帧少画一条 —— 两种错误里只有前者是无害的。
 const DEFAULT_INNER_W: f32 = 320.0;
 const DEFAULT_INNER_H: f32 = 412.0;
 
@@ -2256,11 +2260,18 @@ fn draw_panel(
     // 改前只有 6pt，比会话内部两行之间的 8pt 还紧，层级是倒的。见 `HEADER_GAP`。
     ui.add_space(HEADER_GAP);
 
+    // 分区条**只在两个来源同时存在时**才画（用户 2026-11-24 追加："如果只有一个 AI
+    // 工具在运行，就不再显示灰色框"）。只有一个来源时它不划任何界，只是一块灰底。
+    // 判据与 `view::section_count` 同源，别在这里另写一套。
+    let bands = view::section_count(rows) > 0;
+
     // 第一个分区的条（`claude` 或 `dsh`）。画在**量 `header_h` 之前**，它就成了
     // "头部"的一部分 —— 自动贴合会自动把它算进去，`PanelFit` 一个字段都不用加。
-    if let Some(first) = rows.first() {
-        section_band(ui, if first.is_dsh { "dsh" } else { "claude" });
-        ui.add_space(SECTION_BAND_BOTTOM_GAP);
+    if bands {
+        if let Some(first) = rows.first() {
+            section_band(ui, if first.is_dsh { "dsh" } else { "claude" });
+            ui.add_space(SECTION_BAND_BOTTOM_GAP);
+        }
     }
 
     // ---- 这一帧的纵向版面（自动贴合要用）--------------------------------------
@@ -2330,8 +2341,8 @@ fn draw_panel(
         }
         // 分区边界：最后一条 Claude 行之后、第一条 dsh 行之前，把那条普通分隔线
         // 换成带「dsh」小字的标题线。**只有当下一行也真的画得下时**才换 ——
-        // 否则会出现一条写着 dsh、底下却没有 dsh 行的线。
-        let boundary = i + 1 < rows.len() && i + 1 < fit && rows[i + 1].is_dsh && !row.is_dsh;
+        // 否则会出现一条写着 dsh、底下却没有 dsh 行的线。只有一个来源时分界不存在。
+        let boundary = bands && i + 1 < rows.len() && i + 1 < fit && rows[i + 1].is_dsh && !row.is_dsh;
         draw_row(
             ui,
             row,
@@ -4193,10 +4204,14 @@ mod tests {
     /// 界面上就是"窗口还在、第四行一片空白"。所以缩放变化必须触发一次重新贴合。
     #[test]
     fn a_scale_change_needs_a_refit_or_the_last_row_disappears() {
+        // 夹具里两个来源都在：`DEFAULT_INNER_H` 是按"顶栏带分区条 + 四条会话"标定的，
+        // 只有一个来源时灰条不画、头部矮 32pt，这条测试就量不到它要验的那件事了。
         let rows: Vec<view::Row> = (0..4)
             .map(|i| {
                 let mut r = row(&format!("会话{i}"), State::Done, 10 * (i + 1));
                 r.context_pct = Some(0.1 * (i + 1) as f32);
+                r.session_id = format!("s{i}");
+                r.is_dsh = i == 3;
                 r
             })
             .collect();
@@ -4850,6 +4865,14 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// 一帧里画了几块分区条（`SECTION_BAND_FILL` 的实心矩形）。
+    fn band_fill_rects(shapes: &[egui::Shape]) -> usize {
+        shapes
+            .iter()
+            .filter(|s| matches!(s, egui::Shape::Rect(r) if r.fill == SECTION_BAND_FILL))
+            .count()
     }
 
     /// 面板**内容区**的右边界（窗口宽 − 描边 − 内边距）—— 一行必须整体落在它左边。
@@ -6395,47 +6418,59 @@ mod tests {
     }
 
     /// 分区条本身：一块 `#f0f0f0` 的实心矩形 + 文字画两遍（egui 没有字重，粗体靠重绘模拟）。
+    ///
+    /// 两条都要在（两个来源都在时才画），所以这里一次钉住两块底与两次重绘。
     #[test]
     fn a_section_band_is_a_filled_rect_with_the_label_painted_twice() {
         let mut c = row("Claude 会话", State::Working, 10);
         c.session_id = "c1".into();
-        let shapes = run_frame_sized(&[c], 320.0, 300.0, &config::Config::default());
+        let mut d = row("dsh 会话", State::Working, 20);
+        d.session_id = "session-1".into();
+        d.is_dsh = true;
+        let shapes = run_frame_sized(&[c, d], 320.0, 420.0, &config::Config::default());
         let bands = shapes
             .iter()
             .filter(|s| matches!(s, egui::Shape::Rect(r) if r.fill == SECTION_BAND_FILL))
             .count();
-        assert_eq!(bands, 1, "claude 分区条必须是一块实心灰底");
-        let labels = drawn_texts(&shapes)
-            .into_iter()
-            .filter(|(t, _, _)| t == "claude")
-            .count();
-        assert_eq!(labels, 2, "“加粗”是同一段文字重绘一次模拟的：{labels}");
+        assert_eq!(bands, 2, "claude 与 dsh 各一块实心灰底");
+        let texts = drawn_texts(&shapes);
+        let count = |want: &str| texts.iter().filter(|(t, _, _)| t == want).count();
+        assert_eq!(count("claude"), 2, "“加粗”是同一段文字重绘一次模拟的");
+        assert_eq!(count("dsh"), 2, "“加粗”是同一段文字重绘一次模拟的");
     }
 
-    /// 只有 Claude 时顶栏**逐字**保持原文案；分区条仍画，但只画 `claude` 一条。
+    /// **只有一个来源时不画灰色分区条**（用户 2026-11-24："如果只有一个 AI 工具在运行，
+    /// 就不再显示灰色框"）。只有 Claude 时顶栏**逐字**保持原文案。
     #[test]
-    fn only_claude_rows_keep_the_original_header_and_only_one_band() {
+    fn only_claude_rows_keep_the_original_header_and_draw_no_band() {
         let mut c = row("Claude 会话", State::Working, 10);
         c.session_id = "c1".into();
         let shapes = run_frame_sized(&[c], 320.0, 300.0, &config::Config::default());
         let texts: Vec<String> = drawn_texts(&shapes).into_iter().map(|(t, _, _)| t).collect();
         assert!(texts.iter().any(|t| t == "● claude 会话 · 1 个"), "{texts:?}");
-        assert!(texts.iter().any(|t| t == "claude"), "Claude 区顶上要有 claude 分区条：{texts:?}");
-        assert!(!texts.iter().any(|t| t == "dsh"), "没有 dsh 行就不该有 dsh 分区条");
+        assert!(
+            !texts.iter().any(|t| t == "claude" || t == "dsh"),
+            "只有 Claude 时不该画任何分区条：{texts:?}"
+        );
+        assert_eq!(band_fill_rects(&shapes), 0, "灰底必须一块都没有");
     }
 
-    /// 只有 dsh 时，顶上那条是 `dsh`，不会凭空出现 `claude` 条。
+    /// 只有 dsh 时同样不画灰条 —— 来源靠顶栏的计数说明，不靠那条灰条。
     #[test]
-    fn only_dsh_rows_get_a_single_dsh_band() {
+    fn only_dsh_rows_draw_no_band() {
         let mut d = row("dsh 会话", State::Working, 10);
         d.session_id = "session-1".into();
         d.is_dsh = true;
         let shapes = run_frame_sized(&[d], 320.0, 300.0, &config::Config::default());
         let texts: Vec<String> = drawn_texts(&shapes).into_iter().map(|(t, _, _)| t).collect();
-        assert!(texts.iter().any(|t| t == "dsh"), "dsh 区顶上要有 dsh 分区条：{texts:?}");
         assert!(
-            !texts.iter().any(|t| t == "claude"),
-            "只有 dsh 行时不该画 claude 分区条：{texts:?}"
+            !texts.iter().any(|t| t == "claude" || t == "dsh"),
+            "只有 dsh 时不该画任何分区条：{texts:?}"
+        );
+        assert_eq!(band_fill_rects(&shapes), 0, "灰底必须一块都没有");
+        assert!(
+            texts.iter().any(|t| t == "● 会话 · 1 个（claude 0 · dsh 1）"),
+            "没有灰条时顶栏的计数是唯一区分来源的地方：{texts:?}"
         );
     }
 
@@ -6952,10 +6987,10 @@ mod tests {
         // 常数只是旋钮，**被裁定的是界面上那个数**。
         // 顶栏自己与它的分隔线之间**不**该拉开 —— 那条线属于顶栏（阈值也是 0，不是"小于 16"：
         // 单边宽阈值会把"线浮到离顶栏 15pt"这种走样放过去，复审实测过）。
-        // 2026-11-24 加分区条：顶栏下先是一条 20pt 的 `claude` 灰条，再 12pt 到第一条会话
-        // ⇒ 16（`HEADER_GAP`）+ 20（条高）+ 12（条下空隙）= 48。
+        // 只有一个来源时**没有灰条**（用户 2026-11-24 追加裁定），所以这里量到的
+        // 就是 `HEADER_GAP` 本身：16。
         let gap_header = rect_of("AAA").top() - rules[0];
-        assert!(close(gap_header, 48.0), "顶栏→第一条会话应为 48pt，实测 {gap_header}");
+        assert!(close(gap_header, 16.0), "顶栏→第一条会话应为 16pt，实测 {gap_header}");
         assert!(
             close(rules[0] - header.bottom(), 0.0),
             "分隔线应该**紧贴**顶栏（0pt），实测 {}",
@@ -6988,6 +7023,36 @@ mod tests {
                  （{gap_line} vs {gap_bottom}），否则它读起来是不属于任何一边的掉队注脚"
             );
         }
+
+        // 两个来源都在时，顶栏与第一条会话之间多出那条 20pt 的 `claude` 灰条：
+        // 16（`HEADER_GAP`）+ 20（条高）+ 12（条下空隙）= **48**。
+        let mut dsh_row = row("DDD", State::Done, 30);
+        dsh_row.is_dsh = true;
+        let banded = run_frame_sized(
+            &[row("AAA", State::Done, 10), dsh_row],
+            320.0,
+            420.0,
+            &config::Config::default(),
+        );
+        let banded_rects = drawn_rects(&banded);
+        let top_rule = banded
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::LineSegment { points, .. } => Some(points[0].y),
+                _ => None,
+            })
+            .next()
+            .expect("顶栏下必须有一条分隔线");
+        let first_top = banded_rects
+            .iter()
+            .find(|(t, _)| t == "AAA")
+            .map(|(_, r)| r.top())
+            .expect("没画出第一条会话");
+        let gap_banded = first_top - top_rule;
+        assert!(
+            close(gap_banded, 48.0),
+            "两个来源都在时顶栏→第一条会话应为 48pt，实测 {gap_banded}"
+        );
     }
 
     /// **最小宽度那张退化表（170 消失 / 190 `…` / 200 `示…` / 220 `示例…`）逐格钉住。**
