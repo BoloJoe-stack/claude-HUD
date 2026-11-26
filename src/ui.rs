@@ -1799,9 +1799,16 @@ fn paint_right(
 /// ```
 ///
 /// **几何**（两段都从 `paint_right` 带回来的框上取，不在别处重算一遍）：
-/// - 竖段：x = 状态词的**水平中点**；上端 = 状态词下缘 **+2pt**，下端 = 子代理的**垂直中点**。
-/// - 横段：y = 子代理垂直中点；右端 = 子代理左缘 **−2pt**，左端接竖段下端。
+/// - 常规：竖段 x = 状态词的**水平中点**，上端 = 状态词下缘 **+2pt**、下端 = 子代理的
+///   **垂直中点**；横段 y = 子代理垂直中点，右端 = 子代理左缘 **−2pt**，左端接竖段下端。
 /// - 那两个 2pt 是**留白**，不是审美：贴着画会与字形相碰（`galley` 的框不含字形的左右边距）。
+///
+/// **退化情形（2026-11-26，用户报"同时有子代理和后台，显示错误"）**：徽标文案越宽，
+/// 它的左缘越往左伸；一旦**越过状态词中点**（实测 320pt 窗、`子代理 1 后台 1`：
+/// 左缘 227.41 < 中点 229.53），常规画法两段都会**钻进字里** —— 竖段正好压在「子」的
+/// 中间，横段从字里横穿出来。此时横段根本无处落脚，改成**只画竖段、止于徽标上缘外
+/// 2pt**：仍然从状态词垂下来指着徽标，但不碰任何字形。判据是"横段的右端是否还在
+/// 竖段的右边"，有它才谈得上"左拐"。
 ///
 /// 颜色取**状态色**（与「工作中」同一支），肉眼即知这条线说的是它。
 ///
@@ -1816,13 +1823,24 @@ fn draw_subagent_link(ui: &egui::Ui, state_rect: egui::Rect, sub_rect: egui::Rec
     let y_mid = sub_rect.center().y;
     let x_end = sub_rect.left() - GAP;
 
-    // 竖段：只有高度为正才画（行高异常时宁可不画，也不画出一条反向的线）。
-    if y_mid > y_top {
+    if x_end > x {
+        // 常规 ∟：竖段下到徽标行中心，横段右行收在徽标左缘外。
+        // 只有高度为正才画竖段（行高异常时宁可不画，也不画出一条反向的线）。
+        if y_mid > y_top {
+            ui.painter()
+                .line_segment([egui::pos2(x, y_top), egui::pos2(x, y_mid)], stroke);
+        }
         ui.painter()
-            .line_segment([egui::pos2(x, y_top), egui::pos2(x, y_mid)], stroke);
+            .line_segment([egui::pos2(x, y_mid), egui::pos2(x_end, y_mid)], stroke);
+    } else {
+        // 徽标左缘已越过中点：横段画出来就是横穿字，退化成一条竖段，
+        // 停在徽标上缘外 GAP（见函数注释的退化情形）。
+        let y_bottom = sub_rect.top() - GAP;
+        if y_bottom > y_top {
+            ui.painter()
+                .line_segment([egui::pos2(x, y_top), egui::pos2(x, y_bottom)], stroke);
+        }
     }
-    ui.painter()
-        .line_segment([egui::pos2(x, y_mid), egui::pos2(x_end, y_mid)], stroke);
 }
 
 /// 会名走的那条族（`text_width_in` 与绘制两边**必须**用同一个，见 `text_width_in`）。
@@ -6551,6 +6569,69 @@ mod tests {
         assert!(
             texts.contains("子代理 2 后台 1"),
             "两样同时在跑时必须分得开（不能合成一个「任务 3」）：{texts}"
+        );
+    }
+
+    /// **同时有子代理和后台时，折线不许穿过徽标的字**（用户 2026-11-26 报的
+    /// "如果一个会话同时有子代理和后台，显示错误"）。
+    ///
+    /// 组合文案 `子代理 1 后台 1` 实测 84.59pt 宽，320pt 窗下左缘落在 **227.41**，
+    /// 而「工作中」的中点在同一帧的 **229.53** —— 左缘**越过了**中点。原折线是
+    /// "竖段落在徽标的垂直中心、横段从竖段向左收到徽标左缘外 2pt"，于是竖段正好
+    /// 压在「子」的中间、横段从字里横穿出来。
+    ///
+    /// 判据不看坐标常量，只问一件事：**折线的任何一点是否落进徽标的字框内**。
+    /// 另外钉住"线还在"—— 只删线同样能过上面那条，但用户 2026-09-16 裁定的
+    /// "有子代理就画"就没了。
+    #[test]
+    fn the_link_never_crosses_the_badge_text_when_both_badges_are_shown() {
+        let mut r = row("虚拟用户L3认证项目进度", State::Working, 281);
+        r.subagent_count = 1;
+        r.bg_task_count = 1;
+        let shapes = run_frame_at(&[r], 320.0);
+        let rects = drawn_rects(&shapes);
+        let badge = rects
+            .iter()
+            .find(|(t, _)| t == "子代理 1 后台 1")
+            .map(|(_, r)| *r)
+            .expect("这一帧必须画出组合文案（前置条件）");
+        let (vertical, horizontal) = line_segments(&shapes);
+        assert_eq!(
+            vertical.len(),
+            1,
+            "有子代理就必须还有一条竖段（实测 {vertical:?}）"
+        );
+        for ((ax, ay), (bx, by)) in vertical.iter().chain(horizontal.iter()) {
+            let cross = if close(*ax, *bx) {
+                // 竖段：x 落在字框内，且 y 区间与字框相交。
+                *ax > badge.left()
+                    && *ax < badge.right()
+                    && ay.min(*by) < badge.bottom()
+                    && ay.max(*by) > badge.top()
+            } else {
+                // 横段：y 落在字框内，且 x 区间与字框相交。
+                ay.min(*by) > badge.top()
+                    && ay.max(*by) < badge.bottom()
+                    && ax.min(*bx) < badge.right()
+                    && ax.max(*bx) > badge.left()
+            };
+            assert!(
+                !cross,
+                "折线段 (({ax}, {ay}) → ({bx}, {by})) 穿进了徽标的字框 {badge:?}"
+            );
+        }
+        // 退让后的画法：竖段止于徽标上缘外 2pt（仍从状态词垂下来，只是不再探进字里）。
+        let ((_, top_y), (_, bottom_y)) = vertical[0];
+        assert!(
+            close(bottom_y, badge.top() - 2.0),
+            "竖段下端 {bottom_y} 应停在徽标上缘外 2pt（{}）",
+            badge.top() - 2.0
+        );
+        let state_bottom = rects.iter().find(|(t, _)| t == "工作中").unwrap().1.bottom();
+        assert!(
+            close(top_y, state_bottom + 2.0),
+            "竖段上端 {top_y} 应接在状态词下缘外 2pt（{}）",
+            state_bottom + 2.0
         );
     }
 
