@@ -1431,26 +1431,38 @@ const BAR_ROUNDING: f32 = 1.0;
 /// **会话色板**：行首色块的颜色，用来分辨"这是哪条会话"。
 ///
 /// 用户 2026-09-16 两次裁定："色条区别度不高，每个会话一个颜色" → "**不明显，就用红黄蓝绿**"。
-/// 所以这里就是**红·金·蓝·绿**（+紫/石板蓝给第 5、6 条会话，少数情况下才用得上）。
+/// 前四色就是那四个：**红·金·蓝·绿**。
 ///
 /// ⚠️ **"黄"只能是深金**：亮黄在白底上的对比度只有 **1.1:1**，怎么调都过不了 AA，
 /// 所以取 `#a16207`（4.92:1）—— 它是这些色相里最接近"黄"、又能满足对比度的那个。
-/// 每一色都过白底 WCAG AA（≥ 4.5:1），逐色对比度见 spec §9.0。
+/// 每一色都过白底 WCAG AA（≥ 4.5:1），逐色对比度在下面逐行标着，并由
+/// `every_session_colour_passes_contrast_on_white` 现算守住。
 ///
-/// ⚠️ **这四支色相与状态色重合**（红=出错 / 金=等待确认 / 蓝=完成 / 绿=工作中）。
+/// ⚠️ **前四支色相与状态色重合**（红=出错 / 金=等待确认 / 蓝=完成 / 绿=工作中）。
 /// 这是用户点名要的效果（明显优先），代价是"红块 ≠ 出错"——**状态由状态词的颜色与文字表示**，
 /// 色块只表示身份。改这一块时别把两件事混起来。
 ///
-/// **为什么只有 4 个**：用户原话就是"就用红黄蓝绿"；而且 2026-09-17 实测发现，
-/// 原来备用的第 6 色（石板蓝 `#3d4b6b`）在 8×20 的小色块上**与蓝几乎分不出来**
-/// （截图取样：`#1565c0` 与 `#3d4b6b` 并排看像同一支）。**色板长度 = 4 也正好等于
-/// 用户声明的上限（"我最多开四个"）**，于是"同时可见的互不同色"在他的用法下永远成立。
-/// 超过 4 条时从头上重复 —— 已写进 spec。
-const SESSION_COLORS: [egui::Color32; 4] = [
+/// **为什么从 4 个扩到 8 个**（2026-11-26）：用户真机开到 **5 条**会话，第 1 条与第 3 条
+/// 都是一样的绿 —— 色板只有 4 支，可见条数一超就必然撞色（`colors_for_display` 只能
+/// 在色板还有空位时重排，全满就无解）。用户裁定："不能是一样的，如果没有备选了就新添颜色"。
+///
+/// 新增四色不是随手挑的：以 CIE Lab 距离衡量，**任意两色 ΔE ≥ 38.1**（最短的一对是
+/// 蓝 `#1565c0` 与青 `#006080`；原来的红/金也才 40.9），且每色仍过白底 AA。
+/// **旧备选石板蓝 `#3d4b6b` 仍然不用** —— 它和蓝只差明度、色相几乎相同，8×20 的小色块上
+/// 分不开（2026-09-17 实测）；新的青换的是色相，不是亮度。
+///
+/// 8 条以内同时可见就互不同色；超过 8 条仍从头上重复（`colors_for_display` 只在可见集合
+/// 真的撞色时才局部重排）。改色板长度会**一次性重排所有会话的颜色**（哈希按长度取模），
+/// 这是已知代价。
+const SESSION_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(0xb3, 0x1f, 0x1f), // 红   6.70:1
     egui::Color32::from_rgb(0xa1, 0x62, 0x07), // 金   4.92:1
     egui::Color32::from_rgb(0x15, 0x65, 0xc0), // 蓝   5.75:1
     egui::Color32::from_rgb(0x0f, 0x6b, 0x2e), // 绿   6.64:1
+    egui::Color32::from_rgb(0x6a, 0x1b, 0x9a), // 紫   9.39:1
+    egui::Color32::from_rgb(0xa0, 0x10, 0x60), // 玫红 7.67:1
+    egui::Color32::from_rgb(0x00, 0x60, 0x80), // 青   7.04:1
+    egui::Color32::from_rgb(0x5d, 0x40, 0x37), // 棕   9.32:1
 ];
 
 /// 一条会话自己的**哈希色**（FNV-1a，确定性 —— 不用 `DefaultHasher`，它每进程随机种子，
@@ -1512,7 +1524,7 @@ fn greedy_palette(rows: &[view::Row], want: &[usize]) -> Vec<usize> {
 /// （实测：4 条在屏 `[蓝,绿,红,金]`，第 5 条一进来 `5a0c7e13` 红→金、`9d2f6b04` 金→绿）。
 /// 而色块**唯一的职责**就是回答"这是哪条会话"，颜色一跳，这件事就答不出来了。
 ///
-/// 代价（用户已知情、spec 里写着"超过 4 条时重复"）：会话数超过色板长度时从头上重复。
+/// 代价（用户已知情）：会话数超过色板长度（8）时从头上重复。
 /// 可见集合里因此**可能**出现两条同色 —— 这一条由 [`colors_for_display`] 兜底。
 fn assign_colors(rows: &[view::Row]) -> Vec<egui::Color32> {
     greedy_palette(rows, &want_of(rows))
@@ -6748,16 +6760,17 @@ mod tests {
             r.session_id = id.into();
             r
         };
-        // ① 四条（= 色板长度 = 用户声明的上限）→ 四种颜色，两两不同
-        let rows: Vec<view::Row> = ["a", "b", "c", "d"].iter().map(|i| mk(i)).collect();
+        // ① 八条（= 色板长度）→ 八种颜色，两两不同
+        let ids: Vec<String> = (0..8).map(|i| format!("palette-{i}")).collect();
+        let rows: Vec<view::Row> = ids.iter().map(|i| mk(i)).collect();
         let cs = assign_colors(&rows);
         let uniq: std::collections::HashSet<_> = cs.iter().map(|c| (c.r(), c.g(), c.b())).collect();
-        assert_eq!(uniq.len(), 4, "四条会话必须拿到四种颜色（实测 {cs:?}）");
+        assert_eq!(uniq.len(), 8, "八条会话必须拿到八种颜色（实测 {cs:?}）");
 
         // ② 同一条会话在集合不变时颜色不变（换个顺序也一样 —— 颜色认 id，不认行号）
-        let rev: Vec<view::Row> = ["d", "c", "b", "a"].iter().map(|i| mk(i)).collect();
+        let rev: Vec<view::Row> = ids.iter().rev().map(|i| mk(i)).collect();
         let cs2 = assign_colors(&rev);
-        for (id, c) in ["a", "b", "c", "d"].iter().zip(cs.iter()) {
+        for (id, c) in ids.iter().zip(cs.iter()) {
             let idx = rev.iter().position(|r| r.session_id == *id).unwrap();
             assert_eq!(
                 cs2[idx], *c,
@@ -6766,10 +6779,10 @@ mod tests {
         }
 
         // ③ 超过色板长度就从头上重复（已知代价，写在这里免得被当成 bug）
-        let many: Vec<view::Row> = (0..8).map(|i| mk(&format!("s{i}"))).collect();
+        let many: Vec<view::Row> = (0..12).map(|i| mk(&format!("s{i}"))).collect();
         let cm = assign_colors(&many);
         let uniq_m: std::collections::HashSet<_> = cm.iter().map(|c| (c.r(), c.g(), c.b())).collect();
-        assert_eq!(uniq_m.len(), 4, "超过 4 条只能重复用色板（实测 {uniq_m:?}）");
+        assert_eq!(uniq_m.len(), 8, "超过 8 条只能重复用色板（实测 {uniq_m:?}）");
     }
 
     /// **色板每一色都要过白底 AA**（对比度 ≥ 4.5:1）。
